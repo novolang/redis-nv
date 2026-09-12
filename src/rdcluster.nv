@@ -1,0 +1,331 @@
+// rdcluster.nv — the key slot, the slot map, and the two redirections
+// that are instructions rather than errors.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A CLUSTER CLIENT IS A ROUTING TABLE AND TWO REDIRECTIONS, and every
+// one of the three is a place a client is quietly wrong.
+//
+// THE SLOT IS `CRC16-XMODEM(key) mod 16384`, and it is not any other
+// CRC-16.  XMODEM is poly 0x1021, initial value 0x0000, no
+// reflection, no final xor.  CCITT-FALSE is the SAME POLYNOMIAL with
+// an initial value of 0xffff, and a client that used it computes a
+// different slot for every key — so every command goes to the wrong
+// node, gets a `MOVED`, and works anyway after one extra round trip.
+// That is the worst possible failure mode: correct results, twice the
+// latency, and nothing in any log.  `key_slot` is public and
+// `tests/rdcluster_tests.nv` asserts it against the three vectors
+// Redis's own documentation publishes.
+//
+// crc-nv publishes CCITT-FALSE and MODBUS and has no public
+// constructor taking a parameter set, so XMODEM cannot be built from
+// its surface and the table is here.  The manifest names the row that
+// would change that.
+//
+// A HASH TAG OVERRIDES THE KEY.  `user:{42}:name` hashes `42` and not
+// the whole key, which is how a caller puts related keys on one node
+// so a multi-key command can touch them.  The rule is exact and
+// narrow: the FIRST `{`, then the FIRST `}` AFTER it, and the content
+// between them must be NON-EMPTY — otherwise the whole key is hashed.
+// A client that implemented "anything between braces" gets
+// `foo{}{bar}` wrong, and a client that took the LAST `}` gets
+// `{a}b{c}` wrong.  Both produce a client that mostly works.
+//
+// `MOVED` AND `ASK` ARE DIFFERENT AND CONFUSING THEM IS A BUG THAT
+// SURVIVES TESTING.
+//
+//   * `MOVED slot host:port` — the slot has moved, permanently.
+//     Update the map and go there.
+//   * `ASK slot host:port` — the slot is MIGRATING and this
+//     particular key has already moved.  Go there ONCE, send `ASKING`
+//     FIRST, and do NOT update the map.
+//
+// A client that treated `ASK` as `MOVED` updates its map to point at
+// a node that does not own the slot yet, and then sends every other
+// key in that slot to the wrong place — where they get `MOVED` back,
+// forever, for as long as the migration lasts.  A client that forgot
+// the `ASKING` gets a `MOVED` straight back and loops.  So
+// `RdRedirect` has two variants, `follow` answers whether an `ASKING`
+// is owed, and the map is only updated by one of them.
+//
+// A MULTI-KEY COMMAND MUST STAY IN ONE SLOT.  `MGET a b` where `a`
+// and `b` hash to different slots is refused by the server —
+// `CROSSSLOT` — and there is nothing a client can do about it except
+// know beforehand.  `same_slot` is the question, so a caller can
+// split the command itself rather than discovering the rule from an
+// error.
+
+use rdcmd
+use rderror
+
+// 16384 — how many slots a Redis cluster has.
+//
+// A constant of the protocol, not a configuration: the number is in
+// the cluster bus message format.
+//
+// ```novo
+// use rdcluster
+//
+// fn main() [io]
+//     println("${rdcluster.slot_count()}")
+// ```
+pub fn slot_count() -> Int
+    todo("redis-nv.rdcluster.slot_count")
+
+// The slot a key belongs to.
+//
+// `CRC16-XMODEM(hash_tag_of(key)) mod 16384` — see the module comment
+// for why the CRC variant matters and why the table is here rather
+// than in crc-nv.
+//
+// ```novo
+// use rdcluster
+// use std.bytes
+//
+// fn main() [io]
+//     println("${rdcluster.key_slot(bytes.from_str("foo"))}")
+// ```
+pub fn key_slot(key: Bytes) -> Int
+    todo("redis-nv.rdcluster.key_slot")
+
+// The part of a key that is hashed: the content of the first
+// non-empty `{...}`, or the whole key.
+//
+// THE RULE IS EXACT AND NARROW — see the module comment.  Published
+// separately from `key_slot` because a caller designing a key layout
+// wants to see what its braces will do before it writes a million
+// keys with them.
+//
+// ```novo
+// use rdcluster
+// use std.bytes
+//
+// fn main() [io]
+//     println("${bytes.len(rdcluster.hash_tag(bytes.from_str("user:{42}:name")))}")
+// ```
+pub fn hash_tag(key: Bytes) -> Bytes
+    todo("redis-nv.rdcluster.hash_tag")
+
+// CRC-16/XMODEM over these bytes.
+//
+// Public because the slot is the number everything routes on and a
+// wrong CRC is invisible — correct results, twice the latency, and
+// nothing in any log.  A test that could only check `key_slot` would
+// not say which half was wrong.
+//
+// ```novo
+// use rdcluster
+// use std.bytes
+//
+// fn main() [io]
+//     println("${rdcluster.crc16_xmodem(bytes.from_str("123456789"))}")
+// ```
+pub fn crc16_xmodem(data: Bytes) -> Int
+    todo("redis-nv.rdcluster.crc16_xmodem")
+
+// True when every key in this command is in the same slot.
+//
+// A command whose keys straddle slots is refused by the server with
+// `CROSSSLOT`, and there is nothing a client can do except know
+// beforehand — see the module comment.
+//
+// A command with no keys, or with one, is trivially true.
+//
+// ```novo
+// use rdcluster
+// use rdcmd
+//
+// fn main() [io]
+//     println("${rdcluster.same_slot(rdcmd.command_text(["PING"], [], ""))}")
+// ```
+pub fn same_slot(c: rdcmd.RdCommand) -> Bool
+    todo("redis-nv.rdcluster.same_slot")
+
+// The slot a command routes to, or `None` when it touches no keys or
+// straddles slots.
+//
+// `None` for a keyless command means "send it anywhere", and `None`
+// for a straddling one means "this will be refused" — two different
+// situations behind one answer, which is why `same_slot` exists
+// beside this rather than being folded into it.
+pub fn command_slot(c: rdcmd.RdCommand) -> ?Int
+    todo("redis-nv.rdcluster.command_slot")
+
+// ── the map ──────────────────────────────────────────────────────────
+
+// One node of a cluster.
+pub struct RdNode
+    // The forty-character node id, from `CLUSTER SHARDS` or
+    // `CLUSTER SLOTS`.
+    id: Str
+    host: Str
+    port: Int
+    // True when this node is a replica of another.
+    replica: Bool
+    // The primary's id, for a replica; empty for a primary.
+    primary_id: Str
+
+// Which node owns which slots.
+//
+// A VALUE, so a client holds one and replaces it rather than mutating
+// a shared table under its own requests.
+pub struct RdSlotMap
+    nodes: [RdNode]
+    // Per slot range, the first and last slot and the index into
+    // `nodes` of its primary.  Ranges rather than 16384 entries,
+    // because a cluster has a handful of ranges and the difference
+    // shows up in every refresh.
+    range_first: [Int]
+    range_last: [Int]
+    range_owner: [Int]
+
+// An empty map — what a client starts with, and what makes its first
+// command go anywhere and learn from the `MOVED`.
+//
+// ```novo
+// use rdcluster
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(rdcluster.empty_map().nodes)}")
+// ```
+pub fn empty_map() -> RdSlotMap
+    todo("redis-nv.rdcluster.empty_map")
+
+// `CLUSTER SHARDS` — the modern topology command.
+//
+// Preferred over `CLUSTER SLOTS`, which it replaced in Redis 7: the
+// older one cannot express a shard with no slots and reports health
+// less precisely.  A client that has only `CLUSTER SLOTS` available
+// falls back, which is why both are here.
+pub fn cluster_shards() -> rdcmd.RdCommand
+    todo("redis-nv.rdcluster.cluster_shards")
+
+// `CLUSTER SLOTS` — the older topology command.
+pub fn cluster_slots() -> rdcmd.RdCommand
+    todo("redis-nv.rdcluster.cluster_slots")
+
+// `ASKING` — the one-shot prefix an `ASK` redirection requires.
+//
+// Sent immediately before the redirected command, on the SAME
+// connection, and it applies to exactly one command.  A client that
+// sent it once and then several commands has one routed and the rest
+// bounced.
+pub fn asking() -> rdcmd.RdCommand
+    todo("redis-nv.rdcluster.asking")
+
+// `READONLY` — allow reads on a replica connection.
+//
+// Without it a replica refuses every command with `READONLY`; with
+// it, reads are served from the replica and may be STALE, which is
+// the trade a caller is making and should make on purpose.
+pub fn readonly() -> rdcmd.RdCommand
+    todo("redis-nv.rdcluster.readonly")
+
+// Build a map from a `CLUSTER SHARDS` or `CLUSTER SLOTS` reply.
+pub fn map_of_reply(reply_is_shards: Bool, nodes: [RdNode], range_first: [Int], range_last: [Int],
+                    range_owner: [Int]) -> RdSlotMap
+    todo("redis-nv.rdcluster.map_of_reply")
+
+// The node that owns a slot, or `None` when the map does not cover
+// it.
+//
+// `None` is the ordinary state of a fresh client, not an error: send
+// the command anywhere and learn from the `MOVED`.
+//
+// ```novo
+// use rdcluster
+//
+// fn main() [io]
+//     match rdcluster.owner_of(rdcluster.empty_map(), 0)
+//         Some(n) => println(n.host)
+//         None    => println("send it anywhere and learn")
+// ```
+pub fn owner_of(m: RdSlotMap, slot: Int) -> ?RdNode
+    todo("redis-nv.rdcluster.owner_of")
+
+// The replicas of the node that owns a slot.
+//
+// What a client spreading reads across replicas picks from, having
+// sent `READONLY` and accepted staleness.
+pub fn replicas_of(m: RdSlotMap, slot: Int) -> [RdNode]
+    todo("redis-nv.rdcluster.replicas_of")
+
+// ── the two redirections ─────────────────────────────────────────────
+
+// What to do about a redirection.
+pub enum RdRedirect
+    // Go to this node and UPDATE the map.
+    RdFollowMoved(host: Str, port: Int, slot: Int)
+    // Go to this node ONCE, sending `ASKING` first, and do NOT update
+    // the map — see the module comment.
+    RdFollowAsk(host: Str, port: Int, slot: Int)
+    // Not a redirection.
+    RdNoRedirect
+
+// Read a fault as a redirection.
+//
+// THE FUNCTION THE MODULE COMMENT EXISTS FOR.  A client that treated
+// `ASK` as `MOVED` points its map at a node that does not own the
+// slot yet, and sends every other key in that slot to the wrong place
+// for as long as the migration lasts.
+//
+// ```novo
+// use rdcluster
+// use rderror
+//
+// fn main() [io]
+//     match rdcluster.redirect_of(rderror.RdAsk(slot: 1, host: "h", port: 1))
+//         RdFollowAsk(h, p, s)   => println("once, with ASKING first")
+//         RdFollowMoved(h, p, s) => println("and update the map")
+//         RdNoRedirect           => println("not a redirection")
+// ```
+pub fn redirect_of(f: rderror.RdFault) -> RdRedirect
+    todo("redis-nv.rdcluster.redirect_of")
+
+// True when following this redirection requires an `ASKING` first.
+//
+// The half a client forgets, and forgetting it makes the redirected
+// command bounce straight back with a `MOVED` — and a client that
+// retries on `MOVED` then loops.
+//
+// ```novo
+// use rdcluster
+//
+// fn main() [io]
+//     println("${rdcluster.needs_asking(rdcluster.RdFollowAsk(host: "h", port: 1, slot: 1))}")
+// ```
+pub fn needs_asking(r: RdRedirect) -> Bool
+    todo("redis-nv.rdcluster.needs_asking")
+
+// True when following this redirection should update the slot map.
+//
+// `MOVED` yes, `ASK` NO.  The two are separate functions rather than
+// one returning a pair, because a caller that read one and forgot the
+// other is exactly the bug, and two calls are harder to half-write
+// than two fields of one answer.
+pub fn updates_map(r: RdRedirect) -> Bool
+    todo("redis-nv.rdcluster.updates_map")
+
+// The map with this slot pointed at this node.
+//
+// Only ever called for a `MOVED` — `updates_map` is the guard.
+pub fn with_moved(m: RdSlotMap, slot: Int, host: Str, port: Int) -> RdSlotMap
+    todo("redis-nv.rdcluster.with_moved")
+
+// How many redirections to follow before giving up.
+//
+// A cluster mid-failover can redirect in a circle, and a client with
+// no bound follows it until something times out — which looks like a
+// hang rather than a cluster problem.  Five is what every client
+// settled on; it is a function rather than a constant so a caller can
+// see the number it is being held to.
+//
+// ```novo
+// use rdcluster
+//
+// fn main() [io]
+//     println("${rdcluster.redirect_limit()}")
+// ```
+pub fn redirect_limit() -> Int
+    todo("redis-nv.rdcluster.redirect_limit")

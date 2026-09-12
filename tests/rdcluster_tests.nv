@@ -1,0 +1,170 @@
+// rdcluster_tests.nv — the key slot against Redis's own vectors, the
+// hash-tag rule at its edges, and the two redirections that are not
+// the same.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: redis-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE CRC VECTOR IS THE ONE EVERY CRC IMPLEMENTATION PUBLISHES.
+// CRC-16/XMODEM over the nine bytes "123456789" is 0x31C3.  CCITT-FALSE
+// over the same input is 0x29B1 — the same polynomial with a different
+// initial value — and crc-nv's own tests assert that second number.
+// A client that used the wrong one computes a different slot for every
+// key, gets a MOVED for every command, and WORKS ANYWAY after one extra
+// round trip: correct results, twice the latency, nothing in any log.
+// That is why this assertion is here and why it names both numbers.
+
+use std.test
+use std.bytes
+use std.list
+use rdcluster
+use rdcmd
+use rderror
+
+@test
+fn test_the_crc_is_xmodem_and_not_ccitt_false() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR — see the module comment.
+    test.case("XMODEM over the check string is 0x31C3")
+    test.assert(rdcluster.crc16_xmodem(bytes.from_str("123456789")) == 0x31C3)
+
+    test.case("and is NOT CCITT-FALSE's 0x29B1, which is the same polynomial")
+    test.assert(rdcluster.crc16_xmodem(bytes.from_str("123456789")) != 0x29B1)
+
+    test.case("the empty input is 0x0000, because the initial value is")
+    // CCITT-FALSE answers 0xFFFF here.  The cheapest possible
+    // discriminator between the two, and the one a test should have.
+    test.assert(rdcluster.crc16_xmodem(bytes.zeros(0)) == 0)
+
+    test.case("and every result fits in sixteen bits")
+    test.assert(rdcluster.crc16_xmodem(bytes.from_str("foo")) <= 0xFFFF)
+
+@test
+fn test_a_cluster_has_sixteen_thousand_three_hundred_and_eighty_four_slots() [io]
+    test.case("the number is in the cluster bus message format, not a setting")
+    test.assert(rdcluster.slot_count() == 16384)
+
+    test.case("so every slot is inside it")
+    test.assert(rdcluster.key_slot(bytes.from_str("foo")) < rdcluster.slot_count())
+    test.assert(rdcluster.key_slot(bytes.from_str("foo")) >= 0)
+
+@test
+fn test_the_slots_of_redis_s_own_documented_keys() [io]
+    // The three keys Redis's cluster documentation uses to explain
+    // hash tags, with the slots it states.
+    test.case("foo is slot 12182")
+    test.assert(rdcluster.key_slot(bytes.from_str("foo")) == 12182)
+
+    test.case("and a hash tag makes two different keys share one slot")
+    test.assert(rdcluster.key_slot(bytes.from_str("user:{42}:name"))
+                == rdcluster.key_slot(bytes.from_str("user:{42}:email")))
+
+    test.case("while without one they do not")
+    test.assert(rdcluster.key_slot(bytes.from_str("user:42:name"))
+                != rdcluster.key_slot(bytes.from_str("user:42:email")))
+
+@test
+fn test_the_hash_tag_rule_at_its_three_edges() [io]
+    // The rule is exact and narrow: the FIRST `{`, the FIRST `}` after
+    // it, and NON-EMPTY between them.  Each edge below is a shape a
+    // loose implementation gets wrong while mostly working.
+    test.case("an ordinary tag is what is between the braces")
+    test.assert(bytes.to_str(rdcluster.hash_tag(bytes.from_str("user:{42}:name"))) == "42")
+
+    test.case("no braces means the whole key")
+    test.assert(bytes.to_str(rdcluster.hash_tag(bytes.from_str("plain"))) == "plain")
+
+    test.case("EMPTY braces mean the whole key, not an empty tag")
+    test.assert(bytes.to_str(rdcluster.hash_tag(bytes.from_str("foo{}bar"))) == "foo{}bar")
+
+    test.case("the FIRST closing brace ends it, not the last")
+    // A client that took the last `}` hashes `a}b{c` here.
+    test.assert(bytes.to_str(rdcluster.hash_tag(bytes.from_str("{a}b{c}"))) == "a")
+
+    test.case("an unclosed brace means the whole key")
+    test.assert(bytes.to_str(rdcluster.hash_tag(bytes.from_str("foo{bar"))) == "foo{bar")
+
+    test.case("and the empty-braces case takes the tag from the SECOND pair")
+    // `foo{}{bar}` — the first pair is empty, so the rule keeps
+    // looking and the tag is `bar`.  The shape "anything between
+    // braces" gets wrong.
+    test.assert(bytes.to_str(rdcluster.hash_tag(bytes.from_str("foo{}{bar}"))) == "bar")
+
+@test
+fn test_a_multi_key_command_must_stay_in_one_slot() [io]
+    // A command whose keys straddle slots is refused with CROSSSLOT
+    // and there is nothing a client can do except know beforehand.
+    test.case("a command with no keys is trivially in one slot")
+    test.assert(rdcluster.same_slot(rdcmd.command_text(["PING"], [], "")))
+
+    test.case("and routes nowhere in particular")
+    test.assert_none(rdcluster.command_slot(rdcmd.command_text(["PING"], [], "")))
+
+    test.case("one key is one slot")
+    test.assert(rdcluster.same_slot(rdcmd.get(bytes.from_str("k"))))
+    test.assert_some(rdcluster.command_slot(rdcmd.get(bytes.from_str("k"))))
+
+    test.case("two keys with a shared tag are one slot")
+    test.assert(rdcluster.same_slot(rdcmd.mget([bytes.from_str("{u}:a"),
+                                                bytes.from_str("{u}:b")])))
+
+    test.case("and two without are not")
+    test.assert(rdcluster.same_slot(rdcmd.mget([bytes.from_str("a"),
+                                                bytes.from_str("b")])) == false)
+
+@test
+fn test_moved_and_ask_are_different_instructions() [io]
+    // A client that treated ASK as MOVED points its map at a node that
+    // does not own the slot yet, and sends every other key in that slot
+    // to the wrong place for as long as the migration lasts.
+    let moved = rdcluster.redirect_of(rderror.RdMoved(slot: 7, host: "h", port: 6380))
+    let ask = rdcluster.redirect_of(rderror.RdAsk(slot: 7, host: "h", port: 6380))
+
+    test.case("a MOVED updates the map and needs no ASKING")
+    test.assert(rdcluster.updates_map(moved))
+    test.assert(rdcluster.needs_asking(moved) == false)
+
+    test.case("an ASK needs an ASKING and does NOT update the map")
+    test.assert(rdcluster.needs_asking(ask))
+    test.assert(rdcluster.updates_map(ask) == false)
+
+    test.case("so the two answers differ in both directions")
+    test.assert(rdcluster.updates_map(moved) != rdcluster.updates_map(ask))
+    test.assert(rdcluster.needs_asking(moved) != rdcluster.needs_asking(ask))
+
+    test.case("and something that is not a redirection is neither")
+    let none = rdcluster.redirect_of(rderror.RdWrongType(command: "GET"))
+    test.assert(rdcluster.updates_map(none) == false)
+    test.assert(rdcluster.needs_asking(none) == false)
+
+@test
+fn test_a_fresh_map_knows_nothing_and_that_is_not_an_error() [io]
+    let m = rdcluster.empty_map()
+
+    test.case("it has no nodes and owns no slot")
+    test.assert(list.len(m.nodes) == 0)
+    test.assert_none(rdcluster.owner_of(m, 0))
+    test.assert(list.len(rdcluster.replicas_of(m, 0)) == 0)
+
+    test.case("a MOVED is what teaches it")
+    let m2 = rdcluster.with_moved(m, 7, "127.0.0.1", 6380)
+    test.assert_some(rdcluster.owner_of(m2, 7))
+
+    test.case("and following redirections is bounded, because a failover can loop")
+    test.assert(rdcluster.redirect_limit() > 0)
+    test.assert(rdcluster.redirect_limit() <= 16)
+
+@test
+fn test_the_topology_and_prefix_commands_exist_by_name() [io]
+    test.case("both topology commands, because the old one is still what a Redis 6 has")
+    test.assert(rdcmd.name_of(rdcluster.cluster_shards()) != "")
+    test.assert(rdcmd.name_of(rdcluster.cluster_slots()) != "")
+
+    test.case("ASKING, which is one-shot")
+    test.assert(rdcmd.name_of(rdcluster.asking()) == "ASKING")
+
+    test.case("and READONLY, which buys staleness")
+    test.assert(rdcmd.name_of(rdcluster.readonly()) == "READONLY")
+
+    test.case("a map can be built from a topology reply")
+    test.assert(list.len(rdcluster.map_of_reply(true, [], [], [], []).nodes) == 0)

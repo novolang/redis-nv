@@ -1,0 +1,433 @@
+// rdcmd.nv — a command is a list of byte strings, and building one
+// performs nothing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY REDIS COMMAND IS AN ARRAY OF BULK STRINGS AND NOTHING ELSE.
+// `SET k v EX 30` is five byte strings; so is `EVAL <script> 1 k a`.
+// There is no escaping, no quoting and no injection: an argument
+// containing a space, a newline or a NUL is one argument, because the
+// wire is length-prefixed.  That is the property this module exists to
+// keep — a command built here CANNOT be a command the caller did not
+// mean, however hostile the values in it.
+//
+// SO WHY TYPED COMMANDS AT ALL, given that `command(["SET", k, v])`
+// already works.  Three reasons, and the third is the one that pays:
+//
+//   1. the argument ORDER and the option SPELLINGS are the part
+//      people get wrong — `SET k v EX 30` and `SET k v PX 30` differ
+//      by a factor of a thousand, and `SETEX k 30 v` puts the seconds
+//      in the middle;
+//   2. the REPLY SHAPE is part of the command and nothing else knows
+//      it — `GET` answers a bulk string or a null, `EXISTS` an
+//      integer, `HGETALL` pairs, `SMEMBERS` a set;
+//   3. the KEYS a command touches are what a cluster client has to
+//      know to route it, and they are at a different POSITION in
+//      every command — first for `GET`, second for `EVAL` after a
+//      count, last for `GEORADIUS ... STORE`.  `RdCommand.key_positions`
+//      carries which arguments are keys, so `rdcluster` routes
+//      without a table of special cases and a generic `command` can
+//      declare its own.
+//
+// `command` IS NOT A FALLBACK, IT IS THE ESCAPE HATCH THAT MAKES THE
+// REST SAFE.  Redis adds commands faster than any client tracks them,
+// and a client whose only door is typed is one that cannot use a
+// module, a new command or a `DEBUG` verb.  So `command` is public,
+// first-class, and takes the key positions too.
+//
+// NOTHING HERE CONNECTS.  A `RdCommand` is a value; `rdclient` sends
+// it.  That is what lets a caller build a pipeline, log it, hash it,
+// or hand it to a test double.
+
+use rderror
+
+// A command, built and not yet sent.
+pub struct RdCommand
+    // The arguments, `args[0]` being the command name.  Bytes rather
+    // than `Str` because a Redis key and value are arbitrary binary.
+    args: [Bytes]
+    // Which argument positions are KEYS — see the module comment.
+    // Empty for a command that touches none (`PING`, `INFO`).
+    key_positions: [Int]
+    // What shape the reply will be, for the error message when it is
+    // not.  One of the names `rdresp.type_name` answers, or empty
+    // when the command's reply depends on its arguments.
+    expect: Str
+
+// Build a command from raw arguments.
+//
+// THE ESCAPE HATCH, and it is first-class — see the module comment.
+// `key_positions` is what a cluster client needs and only the caller
+// knows for a command this package does not name.
+//
+// ```novo
+// use rdcmd
+// use std.bytes
+// use std.list
+//
+// fn main() [io]
+//     let c = rdcmd.command([bytes.from_str("PING")], [], "")
+//     println("${list.len(c.args)}")
+// ```
+pub fn command(args: [Bytes], key_positions: [Int], expect: Str) -> RdCommand
+    todo("redis-nv.rdcmd.command")
+
+// Build a command from text arguments.
+//
+// Convenience over `command` for the common case where nothing is
+// binary.  It does NOT quote or escape anything, because there is
+// nothing to escape — see the module comment.
+pub fn command_text(args: [Str], key_positions: [Int], expect: Str) -> RdCommand
+    todo("redis-nv.rdcmd.command_text")
+
+// Encode a command as the bytes that go on the wire: an array of bulk
+// strings, which is the only inline form a Redis server accepts from
+// a client.
+//
+// ```novo
+// use rdcmd
+// use std.bytes
+//
+// fn main() [io]
+//     match rdcmd.encode(rdcmd.command_text(["PING"], [], ""))
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(_) => println("not a command")
+// ```
+pub fn encode(c: RdCommand) -> Result<Bytes, rderror.RdFault>
+    todo("redis-nv.rdcmd.encode")
+
+// Encode several commands into one buffer.
+//
+// What pipelining IS: N commands in one write and N replies in one
+// read, which turns N round trips into one.  The single largest
+// performance decision a Redis client makes.
+pub fn encode_pipeline(cs: [RdCommand]) -> Result<Bytes, rderror.RdFault>
+    todo("redis-nv.rdcmd.encode_pipeline")
+
+// The keys a command touches, by value.
+//
+// What `rdcluster` routes on — see the module comment.
+//
+// ```novo
+// use rdcmd
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(rdcmd.keys_of(rdcmd.command_text(["GET", "k"], [1], "")))}")
+// ```
+pub fn keys_of(c: RdCommand) -> [Bytes]
+    todo("redis-nv.rdcmd.keys_of")
+
+// The command's name, uppercased, for a log line and for an error
+// message.
+pub fn name_of(c: RdCommand) -> Str
+    todo("redis-nv.rdcmd.name_of")
+
+// ── connection and server ────────────────────────────────────────────
+
+// `HELLO <version>` — the handshake that negotiates RESP3, and
+// optionally authenticates in the same round trip.
+//
+// A client that wants RESP3 sends this FIRST, and a server too old to
+// know `HELLO` answers an error — which is not a failure, it is the
+// discovery that this is a RESP2 server.  `rdclient.connect` treats
+// it that way.
+pub fn hello(version: Int, user: Str, password: Str, client_name: Str) -> RdCommand
+    todo("redis-nv.rdcmd.hello")
+
+// `AUTH` — with a user for Redis 6 and later, or with the password
+// alone for the older single-password form.
+//
+// The password goes in the clear unless the connection is TLS.  Said
+// here because it is the kind of thing a reader should not have to
+// infer.
+pub fn auth(user: Str, password: Str) -> RdCommand
+    todo("redis-nv.rdcmd.auth")
+
+// `PING`, optionally with a message that comes back.
+pub fn ping(message: Str) -> RdCommand
+    todo("redis-nv.rdcmd.ping")
+
+// `SELECT <db>` — the numbered database.
+//
+// Does NOT exist in cluster mode, where there is only database 0.  A
+// client that sent it to a cluster gets an error rather than a
+// surprise, which is the right outcome and is worth knowing before
+// writing the call.
+pub fn select_db(index: Int) -> RdCommand
+    todo("redis-nv.rdcmd.select_db")
+
+// `INFO`, for one section or all of them.
+pub fn info(section: Str) -> RdCommand
+    todo("redis-nv.rdcmd.info")
+
+// ── strings ──────────────────────────────────────────────────────────
+
+// `GET` — the value, or a null when the key is not there.
+//
+// ```novo
+// use rdcmd
+// use std.bytes
+//
+// fn main() [io]
+//     println(rdcmd.name_of(rdcmd.get(bytes.from_str("k"))))
+// ```
+pub fn get(key: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.get")
+
+// How long a key should live.
+//
+// An enum rather than two integers, because `EX 30` and `PX 30` are
+// thirty seconds and thirty milliseconds and the two spellings differ
+// by one letter.
+pub enum RdExpiry
+    // No expiry, and CLEAR any the key already had — which is what a
+    // plain `SET` does, and is the surprise in Redis that costs
+    // people a cache.
+    RdNoExpiry
+    RdSeconds(n: Int)
+    RdMilliseconds(n: Int)
+    // Expire at this Unix time, in seconds.
+    RdAtSeconds(unix_s: Int)
+    RdAtMilliseconds(unix_ms: Int)
+    // `KEEPTTL` — leave whatever expiry the key already had.  The one
+    // a caller updating a cached value almost always wants and almost
+    // never writes.
+    RdKeepTtl
+
+// Whether a `SET` may create, may replace, or must do one of them.
+pub enum RdSetMode
+    RdSetAlways
+    // `NX` — only if the key does NOT exist.  What a lock is.
+    RdSetIfAbsent
+    // `XX` — only if it does.
+    RdSetIfPresent
+
+// `SET` with its options in the order the server wants them.
+//
+// The argument order is the part people get wrong — see the module
+// comment.
+//
+// ```novo
+// use rdcmd
+// use std.bytes
+//
+// fn main() [io]
+//     let c = rdcmd.set(bytes.from_str("k"), bytes.from_str("v"),
+//                       rdcmd.RdSeconds(30), rdcmd.RdSetAlways, false)
+//     println(rdcmd.name_of(c))
+// ```
+pub fn set(key: Bytes, value: Bytes, expiry: RdExpiry, mode: RdSetMode, get_old: Bool) -> RdCommand
+    todo("redis-nv.rdcmd.set")
+
+// `GETDEL` — read and remove, atomically.
+pub fn getdel(key: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.getdel")
+
+// `GETEX` — read and re-set the expiry, atomically.
+pub fn getex(key: Bytes, expiry: RdExpiry) -> RdCommand
+    todo("redis-nv.rdcmd.getex")
+
+// `DEL` — remove keys, answering how many existed.
+pub fn del(keys: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.del")
+
+// `EXISTS` — how many of these keys exist.  A key named twice counts
+// twice, which is Redis's own rule and is not what a reader expects.
+pub fn exists(keys: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.exists")
+
+// `INCRBY` — add to an integer value, answering the new one.  The
+// delta may be negative, which is why there is no `decrby` here.
+pub fn incrby(key: Bytes, delta: Int) -> RdCommand
+    todo("redis-nv.rdcmd.incrby")
+
+// `INCRBYFLOAT` — the floating-point sibling, which answers a bulk
+// string on BOTH protocols and not a double.  Redis's own decision.
+pub fn incrbyfloat(key: Bytes, delta: Float) -> RdCommand
+    todo("redis-nv.rdcmd.incrbyfloat")
+
+// `MGET` — several values in one round trip.
+pub fn mget(keys: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.mget")
+
+// `MSET` — several values in one round trip, atomically.
+pub fn mset(keys: [Bytes], values: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.mset")
+
+// `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT`, by the expiry's
+// own shape.
+pub fn expire(key: Bytes, expiry: RdExpiry) -> RdCommand
+    todo("redis-nv.rdcmd.expire")
+
+// `TTL` in milliseconds (`PTTL`).  Answers -1 for a key with no
+// expiry and -2 for a key that is not there — two different negative
+// numbers that a caller has to tell apart.
+pub fn ttl_ms(key: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.ttl_ms")
+
+// ── hashes ───────────────────────────────────────────────────────────
+
+// `HGET`.
+pub fn hget(key: Bytes, field: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.hget")
+
+// `HSET`, with several field-value pairs.
+pub fn hset(key: Bytes, fields: [Bytes], values: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.hset")
+
+// `HDEL`.
+pub fn hdel(key: Bytes, fields: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.hdel")
+
+// `HGETALL` — every field and value.
+//
+// Answers a flat array on RESP2 and a map on RESP3, which is the
+// other place the protocols differ and a caller should not care —
+// `rdresp.as_pairs` reads both.
+pub fn hgetall(key: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.hgetall")
+
+// `HINCRBY`.
+pub fn hincrby(key: Bytes, field: Bytes, delta: Int) -> RdCommand
+    todo("redis-nv.rdcmd.hincrby")
+
+// ── lists ────────────────────────────────────────────────────────────
+
+// Which end of a list.
+pub enum RdEnd
+    RdLeft
+    RdRight
+
+// `LPUSH` or `RPUSH`.
+pub fn push(key: Bytes, end: RdEnd, values: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.push")
+
+// `LPOP` or `RPOP`, with a count.
+pub fn pop(key: Bytes, end: RdEnd, count: Int) -> RdCommand
+    todo("redis-nv.rdcmd.pop")
+
+// `BLPOP` or `BRPOP` — pop, and WAIT up to `timeout_ms` if the list
+// is empty.
+//
+// The command that makes a Redis list a queue, and the one that makes
+// a client's read deadline a protocol matter: a blocking pop holds
+// the connection for its whole timeout, so a client with a shorter
+// socket deadline than the command's disconnects itself.
+// `rdclient.blocking_call` is the entry point that gets that right.
+pub fn blocking_pop(keys: [Bytes], end: RdEnd, timeout_ms: Int) -> RdCommand
+    todo("redis-nv.rdcmd.blocking_pop")
+
+// `LRANGE`, with Redis's inclusive-at-both-ends indices and negative
+// offsets from the end.
+pub fn lrange(key: Bytes, start: Int, stop: Int) -> RdCommand
+    todo("redis-nv.rdcmd.lrange")
+
+// `LLEN`.
+pub fn llen(key: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.llen")
+
+// ── sets ─────────────────────────────────────────────────────────────
+
+// `SADD`.
+pub fn sadd(key: Bytes, members: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.sadd")
+
+// `SREM`.
+pub fn srem(key: Bytes, members: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.srem")
+
+// `SMEMBERS` — every member.  A `~` set on RESP3 and an array on
+// RESP2; either way the ORDER MEANS NOTHING.
+pub fn smembers(key: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.smembers")
+
+// `SISMEMBER`.
+pub fn sismember(key: Bytes, member: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.sismember")
+
+// ── sorted sets ──────────────────────────────────────────────────────
+
+// `ZADD`, with several score-member pairs.
+pub fn zadd(key: Bytes, scores: [Float], members: [Bytes], mode: RdSetMode) -> RdCommand
+    todo("redis-nv.rdcmd.zadd")
+
+// `ZSCORE` — answers a bulk string on RESP2 and a `,` double on
+// RESP3; `rdresp.as_double` reads both.
+pub fn zscore(key: Bytes, member: Bytes) -> RdCommand
+    todo("redis-nv.rdcmd.zscore")
+
+// `ZRANGE` by rank, optionally with the scores interleaved.
+pub fn zrange(key: Bytes, start: Int, stop: Int, with_scores: Bool) -> RdCommand
+    todo("redis-nv.rdcmd.zrange")
+
+// `ZRANGEBYSCORE`, with the bounds as the strings Redis wants — a
+// number, `-inf`, `+inf`, or a `(` prefix for exclusive.
+//
+// Strings and not floats, because `(5` has no float spelling and
+// because a client that took floats would have no way to express an
+// exclusive bound at all.
+pub fn zrange_by_score(key: Bytes, min: Str, max: Str, with_scores: Bool) -> RdCommand
+    todo("redis-nv.rdcmd.zrange_by_score")
+
+// `ZREM`.
+pub fn zrem(key: Bytes, members: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.zrem")
+
+// ── streams ──────────────────────────────────────────────────────────
+
+// `XADD`, with the id as the string Redis wants — `*` for one the
+// server assigns, or `<ms>-<seq>`.
+//
+// A string rather than a pair of integers, because `*` and
+// `<ms>-*` are both legal and neither is a pair.
+pub fn xadd(key: Bytes, id: Str, fields: [Bytes], values: [Bytes]) -> RdCommand
+    todo("redis-nv.rdcmd.xadd")
+
+// `XRANGE`.
+pub fn xrange(key: Bytes, start: Str, end_id: Str, count: Int) -> RdCommand
+    todo("redis-nv.rdcmd.xrange")
+
+// `XREAD`, optionally blocking.
+//
+// The ids are per key and the list lengths have to match, which is
+// the mistake this signature makes visible rather than the flat
+// `XREAD STREAMS k1 k2 id1 id2` form does.
+pub fn xread(keys: [Bytes], ids: [Str], count: Int, block_ms: Int) -> RdCommand
+    todo("redis-nv.rdcmd.xread")
+
+// `XGROUP CREATE`.
+pub fn xgroup_create(key: Bytes, group: Str, id: Str, mkstream: Bool) -> RdCommand
+    todo("redis-nv.rdcmd.xgroup_create")
+
+// `XREADGROUP`.
+pub fn xreadgroup(group: Str, consumer: Str, keys: [Bytes], ids: [Str], count: Int,
+                  block_ms: Int) -> RdCommand
+    todo("redis-nv.rdcmd.xreadgroup")
+
+// `XACK`.
+pub fn xack(key: Bytes, group: Str, ids: [Str]) -> RdCommand
+    todo("redis-nv.rdcmd.xack")
+
+// ── scanning ─────────────────────────────────────────────────────────
+
+// `SCAN` — a cursor over the keyspace that does NOT block the server.
+//
+// The cursor is an OPAQUE number and not an offset: it may go up and
+// down, a full iteration may return a key twice, and only a key
+// present for the whole iteration is guaranteed to appear at all.  A
+// caller that treated it as an offset, or that assumed no
+// duplicates, has written something that works on a small database.
+//
+// `KEYS` is deliberately NOT in this module.  It blocks the server for
+// the length of the scan, and on a production instance that is an
+// outage; a caller that really wants it can build it with `command`,
+// having typed the name.
+pub fn scan(cursor: Int, match_pattern: Str, count: Int, type_filter: Str) -> RdCommand
+    todo("redis-nv.rdcmd.scan")
+
+// `HSCAN`, `SSCAN` and `ZSCAN` share `SCAN`'s cursor rules and take a
+// key.
+pub fn scan_key(command_name: Str, key: Bytes, cursor: Int, match_pattern: Str,
+                count: Int) -> RdCommand
+    todo("redis-nv.rdcmd.scan_key")

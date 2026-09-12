@@ -1,0 +1,259 @@
+// rdpubsub.nv — a subscription as a VALUE the host pumps, and the
+// rule that makes RESP2 and RESP3 different programs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A SUBSCRIPTION IS A VALUE AND NOT A CALLBACK.  `RdSubscription`
+// holds what is subscribed and what has arrived; `pump` advances it
+// one message at a time and answers.  A callback would put the
+// caller's code inside this package's read loop, which means inside
+// this package's effect row: a handler that logged would make the
+// pump `[io]`, one that wrote to a file `[fs]`, and every consumer
+// would pay for the widest handler any consumer wrote.  A value the
+// caller pumps costs the caller exactly what the caller does.
+//
+// ON RESP2, A SUBSCRIBED CONNECTION CANNOT DO ANYTHING ELSE, and that
+// is not this package's restriction — it is the protocol's.  A RESP2
+// pub/sub message is an ordinary array, indistinguishable from an
+// array reply, so Redis removes the ambiguity by refusing every
+// command except `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`,
+// `PUNSUBSCRIBE`, `PING` and `QUIT` on a subscribed connection.  A
+// program that wants both needs TWO connections.
+//
+// ON RESP3, ONE CONNECTION DOES BOTH, because a push frame is its own
+// type.  That is the single most useful thing RESP3 added, and it
+// halves the connection count of every program that subscribes.
+// `requires_second_connection` is the question, answered from the
+// connection's own protocol, so a caller writes the branch once
+// instead of discovering the rule from an error.
+//
+// A SUBSCRIBE CONFIRMATION IS A PUSH TOO, and it looks exactly like a
+// message: `["subscribe", channel, count]` against `["message",
+// channel, payload]`.  A client that did not check the first element
+// treats its own confirmation as a message on the channel — which is
+// a message the application never sent, arriving once per subscribe,
+// forever.  `RdMessage` is the decoded form and `of_push` is where
+// the first element is read.
+//
+// THERE ARE THREE KINDS AND THE THIRD IS NOT OPTIONAL.  A pattern
+// subscription's message carries FOUR elements — the pattern as well
+// as the channel — and a shard subscription (`SSUBSCRIBE`, Redis 7)
+// is a fourth verb whose messages say `smessage`.  A client that
+// decoded three-element messages only drops every pattern message it
+// receives.
+
+use rdclient
+use rdcmd
+use rderror
+use rdresp
+
+// What arrived on a subscribed connection.
+pub enum RdMessage
+    // A message on a channel subscribed by name.
+    RdChannelMessage(channel: Str, payload: Bytes)
+    // A message on a channel matched by a pattern.  FOUR elements on
+    // the wire, not three — see the module comment.
+    RdPatternMessage(pattern: Str, channel: Str, payload: Bytes)
+    // A message on a shard channel (`SSUBSCRIBE`, Redis 7), which is
+    // routed by slot and does not cross a cluster.
+    RdShardMessage(channel: Str, payload: Bytes)
+    // A confirmation that a subscribe or unsubscribe took effect, and
+    // how many subscriptions the connection now has.  NOT a message —
+    // see the module comment.
+    RdSubscribeAck(kind: Str, channel: Str, count: Int)
+    // A push this module does not recognise: client-tracking
+    // invalidation, a monitor line, or something added after this was
+    // written.  Carried rather than dropped, because a push a client
+    // cannot name is still a push it has to account for.
+    RdOtherPush(frame: rdresp.RdFrame)
+
+// A subscription in flight.
+//
+// A VALUE — see the module comment.
+pub struct RdSubscription
+    conn: rdclient.RdConn
+    // What is subscribed, by name, by pattern and by shard.
+    channels: [Str]
+    patterns: [Str]
+    shard_channels: [Str]
+    // How many subscriptions the server last said this connection
+    // has.  Compared with the lists above: a disagreement means a
+    // subscribe was lost, which happens across a reconnect and is the
+    // reason the number is on the wire at all.
+    server_count: Int
+    // Messages decoded and not yet taken.
+    pending: [RdMessage]
+
+// A subscription and one message.
+pub struct RdPumped
+    subscription: RdSubscription
+    // `None` when the deadline passed with nothing arriving, which is
+    // not an error.
+    message: ?RdMessage
+
+// ── the two-connection question ──────────────────────────────────────
+
+// True when this connection needs a SECOND connection for commands
+// while it is subscribed — i.e. when it settled on RESP2.
+//
+// THE QUESTION THE MODULE COMMENT EXISTS FOR, so a caller writes the
+// branch once instead of discovering the rule from an error.
+//
+// ```novo
+// use rdpubsub
+// use rdclient
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  => println("${rdpubsub.requires_second_connection(c)}")
+// ```
+pub fn requires_second_connection(c: rdclient.RdConn) -> Bool
+    todo("redis-nv.rdpubsub.requires_second_connection")
+
+// True when this command is one a subscribed RESP2 connection is
+// still allowed to send: `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`,
+// `PUNSUBSCRIBE`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PING`, `QUIT`,
+// `RESET`.
+//
+// Published so a client can refuse locally rather than sending a
+// command it knows the server will reject — which matters because the
+// rejection arrives as an ordinary error and looks like the command
+// being wrong rather than the connection being subscribed.
+pub fn allowed_while_subscribed(cmd: rdcmd.RdCommand) -> Bool
+    todo("redis-nv.rdpubsub.allowed_while_subscribed")
+
+// ── subscribing ──────────────────────────────────────────────────────
+
+// Begin a subscription on this connection.
+//
+// Sends nothing: the value is built and `subscribe` is what sends.
+// That is what lets a caller construct a subscription, log it, and
+// hand it to a reconnect that re-establishes it.
+//
+// ```novo
+// use rdpubsub
+// use rdclient
+// use std.list
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  => println("${list.len(rdpubsub.subscription(c).channels)}")
+// ```
+pub fn subscription(c: rdclient.RdConn) -> RdSubscription
+    todo("redis-nv.rdpubsub.subscription")
+
+// Subscribe to channels by name.
+pub fn subscribe(s: RdSubscription,
+                 channels: [Str]) -> Result<RdSubscription, rderror.RdFault> [net, time]
+    todo("redis-nv.rdpubsub.subscribe")
+
+// Subscribe to channels by glob pattern.
+//
+// A pattern message carries the pattern AS WELL AS the channel — four
+// elements and not three — which is what `RdPatternMessage` is for.
+pub fn psubscribe(s: RdSubscription,
+                  patterns: [Str]) -> Result<RdSubscription, rderror.RdFault> [net, time]
+    todo("redis-nv.rdpubsub.psubscribe")
+
+// Subscribe to shard channels (Redis 7's `SSUBSCRIBE`).
+//
+// A shard channel is routed by key slot like any other key, so it
+// does not cross a cluster and a publisher and a subscriber have to
+// be on the same shard.  That is the point — it is what makes pub/sub
+// scale in a cluster — and it is also the constraint a caller has to
+// know before choosing it.
+pub fn ssubscribe(s: RdSubscription,
+                  channels: [Str]) -> Result<RdSubscription, rderror.RdFault> [net, time]
+    todo("redis-nv.rdpubsub.ssubscribe")
+
+// Unsubscribe from channels, or from all of them when the list is
+// empty.
+pub fn unsubscribe(s: RdSubscription,
+                   channels: [Str]) -> Result<RdSubscription, rderror.RdFault> [net, time]
+    todo("redis-nv.rdpubsub.unsubscribe")
+
+// Unsubscribe from patterns, or from all of them.
+pub fn punsubscribe(s: RdSubscription,
+                    patterns: [Str]) -> Result<RdSubscription, rderror.RdFault> [net, time]
+    todo("redis-nv.rdpubsub.punsubscribe")
+
+// ── pumping ──────────────────────────────────────────────────────────
+
+// Wait up to `timeout_ms` for one message.
+//
+// THE FUNCTION THE MODULE COMMENT IS ABOUT: the caller drives, so the
+// caller's handler costs the caller's effects and this package stays
+// at `[net, time]`.
+//
+// `None` back means the deadline passed, which is not an error and is
+// how a caller gets its own loop back to do something else.
+//
+// ```novo
+// use rdpubsub
+// use rdclient
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match rdpubsub.pump(rdpubsub.subscription(c), 1000)
+//                 Ok(p)  => println("a message, or the deadline")
+//                 Err(_) => println("the connection went away")
+// ```
+pub fn pump(s: RdSubscription, timeout_ms: Int) -> Result<RdPumped, rderror.RdFault> [net, time]
+    todo("redis-nv.rdpubsub.pump")
+
+// Take every message already decoded, without reading the socket.
+//
+// What a caller with its own event loop calls after something else
+// woke it.
+pub struct RdDrained
+    subscription: RdSubscription
+    messages: [RdMessage]
+
+// Drain.
+pub fn drain(s: RdSubscription) -> RdDrained
+    todo("redis-nv.rdpubsub.drain")
+
+// Decode one push frame into a message.
+//
+// WHERE THE FIRST ELEMENT IS READ — see the module comment.  A client
+// that skipped this step treats its own subscribe confirmation as a
+// message on the channel, once per subscribe, forever.
+//
+// ```novo
+// use rdpubsub
+// use rdresp
+//
+// fn main() [io]
+//     match rdpubsub.of_push(rdresp.RdPush(v: []))
+//         RdChannelMessage(c, p) => println("a message on ${c}")
+//         m                      => println("something else")
+// ```
+pub fn of_push(f: rdresp.RdFrame) -> RdMessage
+    todo("redis-nv.rdpubsub.of_push")
+
+// True when a message is an actual message rather than a
+// confirmation or an unrecognised push.
+//
+// The predicate an application's loop branches on, so that
+// `RdSubscribeAck` cannot be mistaken for traffic.
+pub fn is_message(m: RdMessage) -> Bool
+    todo("redis-nv.rdpubsub.is_message")
+
+// ── publishing ───────────────────────────────────────────────────────
+
+// `PUBLISH` — answers how many subscribers received it.
+//
+// The count is per NODE in a cluster, not per cluster: an ordinary
+// `PUBLISH` is broadcast to every node, and the number that comes
+// back is the one the node answering happened to see.  Worth knowing
+// before building anything on it.
+pub fn publish(channel: Str, payload: Bytes) -> rdcmd.RdCommand
+    todo("redis-nv.rdpubsub.publish")
+
+// `SPUBLISH` — the shard sibling, routed by slot.
+pub fn spublish(channel: Str, payload: Bytes) -> rdcmd.RdCommand
+    todo("redis-nv.rdpubsub.spublish")

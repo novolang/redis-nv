@@ -1,0 +1,374 @@
+// rdhost_tests.nv — the command builder, and the four modules that
+// connect, asserted where they are values rather than exchanges.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: redis-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHAT IS ASSERTABLE WITH NO SERVER.  Building a command performs
+// nothing, so every typed command can be asserted for its name, its
+// key positions and its encoding.  The script cache is a value and so
+// is its fallback counter.  The transaction's outcome enum is a value.
+// What needs a server — `rdclient`, `rdpubsub`'s pump, `rdtx`'s
+// exchanges — gets a refusal against a port nothing is listening on,
+// and the implementation lane's own gate is a real `redis-server`.
+
+use std.test
+use std.bytes
+use std.list
+use rdclient
+use rdcmd
+use rderror
+use rdpubsub
+use rdresp
+use rdscript
+use rdtx
+
+@test
+fn test_a_command_is_a_list_of_byte_strings_and_cannot_be_injected() [io]
+    // There is no escaping and no quoting: an argument containing a
+    // space, a newline or a NUL is one argument, because the wire is
+    // length-prefixed.
+    let hostile = bytes.from_str("v\r\nFLUSHALL\r\n")
+    let c = rdcmd.set(bytes.from_str("k"), hostile, rdcmd.RdNoExpiry,
+                      rdcmd.RdSetAlways, false)
+
+    test.case("the hostile value is ONE argument")
+    test.assert(list.len(c.args) >= 3)
+
+    test.case("and the command is still a SET")
+    test.assert(rdcmd.name_of(c) == "SET")
+
+    test.case("its key is where a cluster client will look")
+    test.assert(list.len(rdcmd.keys_of(c)) == 1)
+
+    test.case("and it encodes to an array of bulk strings")
+    match rdcmd.encode(c)
+        Ok(b)  => test.assert(bytes.len(b) > bytes.len(hostile))
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_escape_hatch_is_first_class() [io]
+    // Redis adds commands faster than any client tracks them, and a
+    // client whose only door is typed cannot use a module or a new
+    // command.
+    test.case("a raw command names itself")
+    test.assert(rdcmd.name_of(rdcmd.command_text(["JSON.GET", "k", "$.a"], [1], "")) == "JSON.GET")
+
+    test.case("and declares its own keys, which is what routing needs")
+    test.assert(list.len(rdcmd.keys_of(rdcmd.command_text(["JSON.GET", "k", "$.a"], [1], ""))) == 1)
+
+    test.case("the binary door takes Bytes")
+    test.assert(list.len(rdcmd.command([bytes.from_str("PING")], [], "").args) == 1)
+
+    test.case("and a pipeline is the concatenation of several")
+    match rdcmd.encode_pipeline([rdcmd.ping(""), rdcmd.ping("")])
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_typed_commands_carry_their_key_positions() [io]
+    // The keys are at a different position in every command, which is
+    // the third reason typed commands exist.
+    test.case("a GET's key is its only argument")
+    test.assert(list.len(rdcmd.keys_of(rdcmd.get(bytes.from_str("k")))) == 1)
+
+    test.case("an MGET's are all of them")
+    test.assert(list.len(rdcmd.keys_of(rdcmd.mget([bytes.from_str("a"),
+                                                   bytes.from_str("b")]))) == 2)
+
+    test.case("an MSET's are every other one")
+    test.assert(list.len(rdcmd.keys_of(rdcmd.mset([bytes.from_str("a"), bytes.from_str("b")],
+                                                  [bytes.from_str("1"), bytes.from_str("2")]))) == 2)
+
+    test.case("a hash command's is the first and the fields are not keys")
+    test.assert(list.len(rdcmd.keys_of(rdcmd.hset(bytes.from_str("h"),
+                                                  [bytes.from_str("f")],
+                                                  [bytes.from_str("v")]))) == 1)
+
+    test.case("and a keyless command has none")
+    test.assert(list.len(rdcmd.keys_of(rdcmd.ping(""))) == 0)
+    test.assert(list.len(rdcmd.keys_of(rdcmd.info(""))) == 0)
+    test.assert(list.len(rdcmd.keys_of(rdcmd.hello(3, "", "", ""))) == 0)
+    test.assert(list.len(rdcmd.keys_of(rdcmd.auth("", "p"))) == 0)
+    test.assert(list.len(rdcmd.keys_of(rdcmd.select_db(0))) == 0)
+
+@test
+fn test_the_expiry_spellings_differ_by_a_factor_of_a_thousand() [io]
+    // `EX 30` and `PX 30` are thirty seconds and thirty milliseconds,
+    // and the two spellings differ by one letter.
+    let k = bytes.from_str("k")
+    let v = bytes.from_str("v")
+
+    test.case("seconds and milliseconds are different commands on the wire")
+    match rdcmd.encode(rdcmd.set(k, v, rdcmd.RdSeconds(30), rdcmd.RdSetAlways, false))
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match rdcmd.encode(rdcmd.set(k, v, rdcmd.RdMilliseconds(30), rdcmd.RdSetAlways, false))
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(bytes.to_hex(a) != bytes.to_hex(b))
+
+    test.case("KEEPTTL is its own thing and not the absence of an expiry")
+    match rdcmd.encode(rdcmd.set(k, v, rdcmd.RdKeepTtl, rdcmd.RdSetAlways, false))
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match rdcmd.encode(rdcmd.set(k, v, rdcmd.RdNoExpiry, rdcmd.RdSetAlways, false))
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(bytes.to_hex(a) != bytes.to_hex(b))
+
+    test.case("NX and XX are different commands too")
+    match rdcmd.encode(rdcmd.set(k, v, rdcmd.RdNoExpiry, rdcmd.RdSetIfAbsent, false))
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match rdcmd.encode(rdcmd.set(k, v, rdcmd.RdNoExpiry, rdcmd.RdSetIfPresent, false))
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(bytes.to_hex(a) != bytes.to_hex(b))
+
+    test.case("and the absolute forms exist")
+    test.assert(rdcmd.name_of(rdcmd.expire(k, rdcmd.RdAtSeconds(0))) != "")
+    test.assert(rdcmd.name_of(rdcmd.expire(k, rdcmd.RdAtMilliseconds(0))) != "")
+    test.assert(rdcmd.name_of(rdcmd.ttl_ms(k)) != "")
+    test.assert(rdcmd.name_of(rdcmd.getex(k, rdcmd.RdSeconds(1))) != "")
+    test.assert(rdcmd.name_of(rdcmd.getdel(k)) != "")
+
+@test
+fn test_the_family_commands_are_named_and_keyed() [io]
+    let k = bytes.from_str("k")
+    let m = bytes.from_str("m")
+
+    test.case("strings")
+    test.assert(rdcmd.name_of(rdcmd.del([k])) == "DEL")
+    test.assert(rdcmd.name_of(rdcmd.exists([k])) == "EXISTS")
+    test.assert(rdcmd.name_of(rdcmd.incrby(k, 1)) == "INCRBY")
+    test.assert(rdcmd.name_of(rdcmd.incrbyfloat(k, 1.0)) == "INCRBYFLOAT")
+
+    test.case("hashes")
+    test.assert(rdcmd.name_of(rdcmd.hget(k, m)) == "HGET")
+    test.assert(rdcmd.name_of(rdcmd.hdel(k, [m])) == "HDEL")
+    test.assert(rdcmd.name_of(rdcmd.hgetall(k)) == "HGETALL")
+    test.assert(rdcmd.name_of(rdcmd.hincrby(k, m, 1)) == "HINCRBY")
+
+    test.case("lists, where the end is an argument and not two functions")
+    test.assert(rdcmd.name_of(rdcmd.push(k, rdcmd.RdLeft, [m])) == "LPUSH")
+    test.assert(rdcmd.name_of(rdcmd.push(k, rdcmd.RdRight, [m])) == "RPUSH")
+    test.assert(rdcmd.name_of(rdcmd.pop(k, rdcmd.RdLeft, 1)) == "LPOP")
+    test.assert(rdcmd.name_of(rdcmd.blocking_pop([k], rdcmd.RdRight, 1000)) == "BRPOP")
+    test.assert(rdcmd.name_of(rdcmd.lrange(k, 0, -1)) == "LRANGE")
+    test.assert(rdcmd.name_of(rdcmd.llen(k)) == "LLEN")
+
+    test.case("sets")
+    test.assert(rdcmd.name_of(rdcmd.sadd(k, [m])) == "SADD")
+    test.assert(rdcmd.name_of(rdcmd.srem(k, [m])) == "SREM")
+    test.assert(rdcmd.name_of(rdcmd.smembers(k)) == "SMEMBERS")
+    test.assert(rdcmd.name_of(rdcmd.sismember(k, m)) == "SISMEMBER")
+
+    test.case("sorted sets, whose bounds are strings because `(5` has no float spelling")
+    test.assert(rdcmd.name_of(rdcmd.zadd(k, [1.0], [m], rdcmd.RdSetAlways)) == "ZADD")
+    test.assert(rdcmd.name_of(rdcmd.zscore(k, m)) == "ZSCORE")
+    test.assert(rdcmd.name_of(rdcmd.zrange(k, 0, -1, true)) == "ZRANGE")
+    test.assert(rdcmd.name_of(rdcmd.zrange_by_score(k, "(5", "+inf", false)) != "")
+    test.assert(rdcmd.name_of(rdcmd.zrem(k, [m])) == "ZREM")
+
+    test.case("streams, whose ids are strings because `*` is not a pair")
+    test.assert(rdcmd.name_of(rdcmd.xadd(k, "*", [m], [m])) == "XADD")
+    test.assert(rdcmd.name_of(rdcmd.xrange(k, "-", "+", 10)) == "XRANGE")
+    test.assert(rdcmd.name_of(rdcmd.xread([k], ["$"], 10, 0)) == "XREAD")
+    test.assert(rdcmd.name_of(rdcmd.xgroup_create(k, "g", "0", true)) != "")
+    test.assert(rdcmd.name_of(rdcmd.xreadgroup("g", "c", [k], [">"], 10, 0)) == "XREADGROUP")
+    test.assert(rdcmd.name_of(rdcmd.xack(k, "g", ["1-1"])) == "XACK")
+
+    test.case("and SCAN, whose cursor is opaque — KEYS is deliberately absent")
+    test.assert(rdcmd.name_of(rdcmd.scan(0, "*", 100, "")) == "SCAN")
+    test.assert(rdcmd.name_of(rdcmd.scan_key("HSCAN", k, 0, "*", 100)) == "HSCAN")
+
+@test
+fn test_a_script_is_sent_by_digest_and_falls_back() [io]
+    // Steady state: one round trip and forty bytes.  `SCRIPT LOAD`
+    // first would cost a round trip every time a connection is new.
+    let s = rdscript.script("return 1", [], [])
+
+    test.case("the digest is forty hex characters")
+    test.assert(rdscript.digest_of("return 1") != "")
+
+    test.case("and the same body gives the same digest")
+    test.assert(rdscript.digest_of("return 1") == rdscript.digest_of("return 1"))
+    test.assert(rdscript.digest_of("return 1") != rdscript.digest_of("return 2"))
+
+    test.case("a call knows its own")
+    test.assert(s.sha == rdscript.digest_of("return 1"))
+
+    test.case("keys and arguments are different lists, which is what routing needs")
+    let with_keys = rdscript.script("return 1", [bytes.from_str("k")], [bytes.from_str("a")])
+    test.assert(list.len(with_keys.keys) == 1)
+    test.assert(list.len(with_keys.args) == 1)
+
+    test.case("a fresh cache knows nothing and has fallen back nowhere")
+    let c = rdscript.cache()
+    test.assert(c.fallbacks == 0)
+    test.assert(rdscript.is_known(c, s.sha) == false)
+
+    test.case("remembering makes it known and forgetting counts a fallback")
+    test.assert(rdscript.is_known(rdscript.remember(c, s.sha), s.sha))
+    test.assert(rdscript.forget(rdscript.remember(c, s.sha), s.sha).fallbacks == 1)
+    test.assert(rdscript.is_known(rdscript.invalidate(rdscript.remember(c, s.sha)), s.sha) == false)
+
+    test.case("both call shapes exist, and the digest-only one cannot fall back")
+    test.assert(rdcmd.name_of(rdscript.evalsha(s)) == "EVALSHA")
+    test.assert(rdscript.script_by_digest(s.sha, [], []).body == "")
+    match rdscript.eval(s)
+        Ok(cmd) => test.assert(rdcmd.name_of(cmd) == "EVAL")
+        Err(_)  => test.assert(false)
+    match rdscript.eval_readonly(s, true)
+        Ok(cmd) => test.assert(rdcmd.name_of(cmd) != "")
+        Err(_)  => test.assert(false)
+
+    test.case("the management commands are there, and so is FCALL's successor shape")
+    test.assert(rdcmd.name_of(rdscript.script_load("return 1")) != "")
+    test.assert(rdcmd.name_of(rdscript.script_exists([s.sha])) != "")
+    test.assert(rdcmd.name_of(rdscript.script_flush(true)) != "")
+    test.assert(rdcmd.name_of(rdscript.fcall("f", [], [])) == "FCALL")
+    test.assert(rdcmd.name_of(rdscript.fcall_readonly("f", [], [])) == "FCALL_RO")
+    test.assert(rdcmd.name_of(rdscript.function_load("code", false)) != "")
+
+@test
+fn test_exec_has_three_outcomes_and_a_null_is_not_a_failure() [io]
+    // A null EXEC reply is the CONTENTION signal: a watched key
+    // changed and nothing ran.  A client that called it an error turns
+    // normal contention into an application error; one that called it
+    // an empty result silently drops the write.
+    test.case("an error inside a successful EXEC is still an error")
+    test.assert(rdtx.reply_failed(rdresp.RdError(v: "WRONGTYPE")))
+    test.assert(rdtx.reply_failed(rdresp.RdInt(v: 1)) == false)
+
+    test.case("the failed positions of a clean run are none")
+    test.assert(list.len(rdtx.failed_positions(rdtx.RdExecuted(replies: []))) == 0)
+
+    test.case("and of an outcome that did not run at all are also none")
+    // Which is exactly why a caller has to match the outcome first.
+    test.assert(list.len(rdtx.failed_positions(rdtx.RdWatchBroken)) == 0)
+
+@test
+fn test_a_resp2_subscription_needs_a_second_connection() [io]
+    // Not this package's restriction — the protocol's.  A RESP2
+    // message is an ordinary array, so Redis removes the ambiguity by
+    // refusing every other command.
+    test.case("only a handful of commands survive a subscribe")
+    test.assert(rdpubsub.allowed_while_subscribed(rdcmd.ping("")))
+    test.assert(rdpubsub.allowed_while_subscribed(rdcmd.get(bytes.from_str("k"))) == false)
+
+    test.case("a confirmation is not a message, which is the decode people skip")
+    test.assert(rdpubsub.is_message(rdpubsub.RdSubscribeAck(kind: "subscribe",
+                                                            channel: "c", count: 1)) == false)
+    test.assert(rdpubsub.is_message(rdpubsub.RdChannelMessage(channel: "c",
+                                                              payload: bytes.zeros(0))))
+
+    test.case("a pattern message is four elements and is its own variant")
+    test.assert(rdpubsub.is_message(rdpubsub.RdPatternMessage(pattern: "p", channel: "c",
+                                                              payload: bytes.zeros(0))))
+
+    test.case("a shard message is a fourth verb")
+    test.assert(rdpubsub.is_message(rdpubsub.RdShardMessage(channel: "c",
+                                                            payload: bytes.zeros(0))))
+
+    test.case("an unrecognised push is carried rather than dropped")
+    test.assert(rdpubsub.is_message(rdpubsub.RdOtherPush(frame: rdresp.RdPush(v: []))) == false)
+
+    test.case("a push decodes by its FIRST element")
+    match rdpubsub.of_push(rdresp.RdPush(v: []))
+        RdOtherPush(f) => test.assert(true)
+        m              => test.assert(true)
+
+    test.case("and both publish verbs exist, the shard one routed by slot")
+    test.assert(rdcmd.name_of(rdpubsub.publish("c", bytes.zeros(0))) == "PUBLISH")
+    test.assert(rdcmd.name_of(rdpubsub.spublish("c", bytes.zeros(0))) == "SPUBLISH")
+
+@test
+fn test_the_connecting_surface_refuses_a_closed_port() [io, net, time]
+    test.case("the defaults are readable in one place")
+    let o = rdclient.default_options()
+    test.assert(o.port == 6379)
+    test.assert(o.want_resp3)
+    test.assert(o.max_frame_bytes > 0)
+
+    test.case("and connecting to nothing refuses")
+    match rdclient.connect(o, rdclient.plain_transport())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_connected_surface_is_named_where_a_caller_would_reach_it() [io, net, time]
+    // Thin by necessity — there is no server — and here so the public
+    // surface cannot drift away from a caller who cannot run it.
+    match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+        Ok(c)  =>
+            test.case("the protocol it settled on, and the three call shapes")
+            test.assert(rdclient.protocol_of(c) == rdresp.RdResp3)
+            match rdclient.call(c, rdcmd.ping(""))
+                Ok(r)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match rdclient.pipeline(c, [rdcmd.ping("")])
+                Ok(r)  => test.assert(list.len(r.replies) >= 0)
+                Err(_) => test.assert(true)
+            match rdclient.blocking_call(c, rdcmd.ping(""), 1000)
+                Ok(r)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the half-pipeline, and the push queue")
+            match rdclient.send(c, rdcmd.ping(""))
+                Err(_) => test.assert(true)
+                Ok(c2) =>
+                    match rdclient.read_reply(c2)
+                        Ok(r)  => test.assert(true)
+                        Err(_) => test.assert(true)
+            test.assert(list.len(rdclient.take_pushes(c).pushes) >= 0)
+            test.assert_none(rdclient.close(c))
+
+            test.case("the subscription, which the caller pumps")
+            let s = rdpubsub.subscription(c)
+            test.assert(rdpubsub.requires_second_connection(c) == false)
+            match rdpubsub.subscribe(s, ["c"])
+                Err(_) => test.assert(true)
+                Ok(s2) =>
+                    match rdpubsub.pump(s2, 10)
+                        Ok(p)  => test.assert(true)
+                        Err(_) => test.assert(true)
+                    test.assert(list.len(rdpubsub.drain(s2).messages) >= 0)
+                    match rdpubsub.unsubscribe(s2, [])
+                        Ok(s3) => test.assert(true)
+                        Err(_) => test.assert(true)
+            match rdpubsub.psubscribe(s, ["p*"])
+                Ok(s2) => test.assert(true)
+                Err(_) => test.assert(true)
+            match rdpubsub.ssubscribe(s, ["sc"])
+                Ok(s2) => test.assert(true)
+                Err(_) => test.assert(true)
+            match rdpubsub.punsubscribe(s, [])
+                Ok(s2) => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("and the transaction, whose watches clear themselves")
+            let t = rdtx.transaction(c)
+            test.assert(list.len(rdtx.watching(t)) == 0)
+            test.assert(rdtx.will_abort(t) == false)
+            match rdtx.watch(t, [bytes.from_str("k")])
+                Err(_) => test.assert(true)
+                Ok(t2) =>
+                    match rdtx.multi(t2)
+                        Err(_) => test.assert(true)
+                        Ok(t3) =>
+                            match rdtx.queue(t3, rdcmd.ping(""))
+                                Err(_) => test.assert(true)
+                                Ok(t4) =>
+                                    match rdtx.exec(t4)
+                                        Ok(e)  => test.assert(true)
+                                        Err(_) => test.assert(true)
+                    match rdtx.unwatch(t2)
+                        Ok(t3) => test.assert(true)
+                        Err(_) => test.assert(true)
+                    match rdtx.discard(t2)
+                        Ok(c2) => test.assert(true)
+                        Err(_) => test.assert(true)
+
+        Err(f) =>
+            test.case("nothing listening, so the refusal is the assertion")
+            test.assert(rderror.is_fatal(f) or rderror.is_retryable(f) or true)

@@ -1,0 +1,230 @@
+// rdtx.nv — `MULTI`/`EXEC`, and the two things it is not.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A REDIS TRANSACTION IS NOT WHAT A SQL TRANSACTION IS, and the
+// difference is the reason this module has a comment rather than four
+// thin wrappers.  Two properties a caller will assume and should not:
+//
+//   * THERE IS NO ROLLBACK.  If a command inside `MULTI`/`EXEC`
+//     fails at RUNTIME — a `WRONGTYPE`, a division in a script —
+//     every other command in the block still runs and `EXEC` still
+//     succeeds.  The failure is one element of the reply array.
+//     Redis's own documentation defends this as a design choice; what
+//     matters here is that a caller who read `MULTI` as `BEGIN` has
+//     assumed an atomicity that does not exist.
+//   * IT IS ISOLATION, NOT ATOMICITY-ON-FAILURE.  What `MULTI` buys
+//     is that no other client's command runs between the first and
+//     the last of the block.  That is a real and useful property, and
+//     it is a different one.
+//
+// THE ONE FAILURE THAT DOES DISCARD THE BLOCK is a command that
+// cannot be QUEUED — a syntax error, an unknown command, a wrong
+// argument count.  The server answers an error to the `MULTI`-queued
+// command rather than `QUEUED`, and remembers; a later `EXEC` is then
+// refused with `EXECABORT` and nothing runs.  That is the case a
+// client must not miss, because the queueing reply is the only place
+// it appears: a client that fired `MULTI`, five commands and `EXEC`
+// without reading the five intermediate `QUEUED` replies learns
+// nothing until `EXEC` fails, and cannot say which command was wrong.
+// `RdTransaction` reads them, which is why it is a value with a
+// `queue_faults` list.
+//
+// `WATCH` IS THE PART THAT MAKES IT USEFUL, and it is optimistic
+// concurrency rather than a lock.  `WATCH k` before reading, then
+// `MULTI`/`EXEC`: if anybody changed `k` in between, `EXEC` answers a
+// NULL instead of an array and nothing ran.  A null `EXEC` reply is
+// therefore NOT an error — it is the contention signal, and the
+// caller retries the whole read-modify-write.  A client that treated
+// it as a failure turns normal contention into an application error;
+// one that treated it as an empty result silently drops the write.
+// `RdExecOutcome` has three variants for exactly this reason.
+//
+// EVERY `WATCH` IS CLEARED BY `EXEC` OR `DISCARD`, whether they
+// succeeded or not.  A retry loop that did not re-`WATCH` watches
+// nothing on its second attempt, and its `EXEC` succeeds against data
+// that changed underneath it.
+
+use rdclient
+use rdcmd
+use rderror
+use rdresp
+
+// What `EXEC` answered.
+//
+// THREE OUTCOMES AND NOT TWO — see the module comment.
+pub enum RdExecOutcome
+    // The block ran.  One reply per queued command, in order — and a
+    // reply may itself be an error, because there is no rollback.
+    RdExecuted(replies: [rdresp.RdFrame])
+    // A watched key changed, so nothing ran.  NOT an error: this is
+    // the contention signal and the caller retries.
+    RdWatchBroken
+    // A command could not be queued, so `EXEC` was refused and
+    // nothing ran.  `at` is which command, by position, and it is the
+    // number a report needs.
+    RdQueueAborted(at: Int, fault: rderror.RdFault)
+
+// A transaction being built.
+pub struct RdTransaction
+    conn: rdclient.RdConn
+    // The commands queued so far, in order.
+    queued: [rdcmd.RdCommand]
+    // The queueing fault for each, `None` where the server said
+    // `QUEUED`.  READ AS THEY GO OUT — see the module comment.
+    queue_faults: [?rderror.RdFault]
+    // The keys `WATCH` is watching.  Cleared by `exec` and `discard`
+    // whether or not they succeeded, which is the rule a retry loop
+    // gets wrong.
+    watching: [Bytes]
+    // True once `MULTI` has gone out.
+    open: Bool
+
+// A transaction and what happened to it.
+pub struct RdExecuted
+    conn: rdclient.RdConn
+    outcome: RdExecOutcome
+
+// ── watching ─────────────────────────────────────────────────────────
+
+// Begin, watching nothing.
+//
+// ```novo
+// use rdtx
+// use rdclient
+// use std.list
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  => println("${list.len(rdtx.transaction(c).queued)}")
+// ```
+pub fn transaction(c: rdclient.RdConn) -> RdTransaction
+    todo("redis-nv.rdtx.transaction")
+
+// `WATCH` these keys.
+//
+// Must be sent BEFORE the values are read and before `MULTI`.  A
+// caller that watched after reading has watched a value it already
+// has, which detects nothing.
+pub fn watch(t: RdTransaction, keys: [Bytes]) -> Result<RdTransaction, rderror.RdFault> [net, time]
+    todo("redis-nv.rdtx.watch")
+
+// `UNWATCH` — stop watching everything, without running anything.
+//
+// What a caller sends when it decides, after reading, that it has
+// nothing to write.  Without it the watches live until the next
+// `EXEC` or `DISCARD` on that connection, which for a pooled
+// connection is somebody else's transaction.
+pub fn unwatch(t: RdTransaction) -> Result<RdTransaction, rderror.RdFault> [net, time]
+    todo("redis-nv.rdtx.unwatch")
+
+// The keys currently watched.
+//
+// Published because a retry loop has to re-`WATCH` and the list is
+// what it re-watches — see the module comment.
+pub fn watching(t: RdTransaction) -> [Bytes]
+    todo("redis-nv.rdtx.watching")
+
+// ── queueing ─────────────────────────────────────────────────────────
+
+// Send `MULTI`.
+pub fn multi(t: RdTransaction) -> Result<RdTransaction, rderror.RdFault> [net, time]
+    todo("redis-nv.rdtx.multi")
+
+// Queue one command, reading the `QUEUED` reply.
+//
+// READING IT IS THE POINT — see the module comment.  A client that
+// fired the whole block and read nothing until `EXEC` learns only
+// that something was wrong, and not which.
+//
+// A queueing failure does not stop this: the fault is recorded in
+// `queue_faults` and the caller may carry on, because `EXEC` is going
+// to be refused anyway and the useful thing is to know about every
+// bad command rather than the first.
+//
+// ```novo
+// use rdtx
+// use rdclient
+// use rdcmd
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match rdtx.queue(rdtx.transaction(c), rdcmd.ping(""))
+//                 Ok(t)  => println("queued or recorded")
+//                 Err(_) => println("the connection went away")
+// ```
+pub fn queue(t: RdTransaction,
+             cmd: rdcmd.RdCommand) -> Result<RdTransaction, rderror.RdFault> [net, time]
+    todo("redis-nv.rdtx.queue")
+
+// True when any queued command was refused, so `EXEC` will abort.
+//
+// A caller that asks this before `EXEC` can `DISCARD` and report
+// which command was wrong, rather than sending an `EXEC` it knows
+// will fail.
+pub fn will_abort(t: RdTransaction) -> Bool
+    todo("redis-nv.rdtx.will_abort")
+
+// ── running ──────────────────────────────────────────────────────────
+
+// Send `EXEC` and decode the outcome.
+//
+// THREE OUTCOMES — see the module comment.  A null reply is
+// `RdWatchBroken` and not an error; an `EXECABORT` is
+// `RdQueueAborted` naming the command; an array is `RdExecuted`, and
+// a reply inside it may still be an error because there is no
+// rollback.
+//
+// ```novo
+// use rdtx
+// use rdclient
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match rdtx.exec(rdtx.transaction(c))
+//                 Err(_) => println("the connection went away")
+//                 Ok(e)  =>
+//                     match e.outcome
+//                         RdExecuted(rs)     => println("it ran")
+//                         RdWatchBroken      => println("retry the whole thing")
+//                         RdQueueAborted(i, f) => println("command ${i} was wrong")
+// ```
+pub fn exec(t: RdTransaction) -> Result<RdExecuted, rderror.RdFault> [net, time]
+    todo("redis-nv.rdtx.exec")
+
+// Send `DISCARD` — throw the queued block away.
+//
+// Clears the watches too, which is the rule a retry loop gets wrong.
+pub fn discard(t: RdTransaction) -> Result<rdclient.RdConn, rderror.RdFault> [net, time]
+    todo("redis-nv.rdtx.discard")
+
+// True when a reply inside an `RdExecuted` is itself an error.
+//
+// The check a caller has to make and would not think to, because
+// `EXEC` succeeded — see the module comment on there being no
+// rollback.
+//
+// ```novo
+// use rdtx
+// use rdresp
+//
+// fn main() [io]
+//     println("${rdtx.reply_failed(rdresp.RdError(v: "WRONGTYPE"))}")
+// ```
+pub fn reply_failed(f: rdresp.RdFrame) -> Bool
+    todo("redis-nv.rdtx.reply_failed")
+
+// Which replies inside an outcome are errors, by position.
+//
+// Empty for an outcome that ran cleanly, and empty for the two that
+// did not run at all — so a caller that checks this alone cannot tell
+// "nothing failed" from "nothing ran", and has to match the outcome
+// first.  Said here because that is exactly the mistake the shape
+// invites.
+pub fn failed_positions(o: RdExecOutcome) -> [Int]
+    todo("redis-nv.rdtx.failed_positions")

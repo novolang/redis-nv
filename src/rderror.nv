@@ -1,0 +1,169 @@
+// rderror.nv — what a Redis server refuses, and what goes wrong before
+// it gets the chance.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A REDIS ERROR IS A STRING WITH A CONVENTION IN IT, and the
+// convention is load-bearing even though nothing enforces it.  An
+// error reply is a line of text whose FIRST WORD is conventionally an
+// uppercase code — `WRONGTYPE`, `NOSCRIPT`, `MOVED`, `ASK`, `LOADING`,
+// `BUSYGROUP`, `NOAUTH`, `READONLY`, `CLUSTERDOWN`, `TRYAGAIN` — and
+// the rest is prose.  Four of those codes are not errors at all in the
+// sense a caller means: they are INSTRUCTIONS.
+//
+//   * `MOVED <slot> <host:port>` says the key lives on another node
+//     and the client should go there and remember;
+//   * `ASK <slot> <host:port>` says it is being migrated and the
+//     client should go there ONCE, with an `ASKING` first, and NOT
+//     remember;
+//   * `NOSCRIPT` says the script is not cached and the client should
+//     send the body with `EVAL` instead;
+//   * `TRYAGAIN` says a multi-key command straddles a slot migration
+//     and the client should retry shortly.
+//
+// A client that surfaced any of those to its caller as "an error from
+// Redis" has turned a routine part of the protocol into an
+// application-visible failure.  So each of them is its own variant
+// here, carrying the fields it carries, and `RdServerError` is what is
+// left — the errors that really are errors.
+//
+// `WRONGTYPE` IS ITS OWN VARIANT FOR A DIFFERENT REASON.  It means the
+// key exists and holds a different type, which in Redis is almost
+// always a bug in the CALLER — two parts of a program using the same
+// key for a string and a hash — and it is worth being able to branch
+// on that without matching on text.
+
+// A fault talking to a Redis server.
+pub enum RdFault
+    // An error reply that is an error: the code word and the prose
+    // after it, as they arrived.
+    RdServerError(code: Str, message: Str)
+    // The key exists and holds a different type.  Almost always a bug
+    // in the caller — see the module comment.
+    RdWrongType(command: Str)
+    // `MOVED`: the slot lives on another node, permanently.  A client
+    // should update its slot map and go there.
+    RdMoved(slot: Int, host: Str, port: Int)
+    // `ASK`: the slot is migrating.  Go there ONCE, sending `ASKING`
+    // first, and do NOT update the slot map — see `rdcluster`.
+    RdAsk(slot: Int, host: Str, port: Int)
+    // `TRYAGAIN`: a multi-key command straddles a migration.  Wait
+    // and resend.
+    RdTryAgain(command: Str)
+    // `NOSCRIPT`: the digest is not cached on this node.  Send the
+    // body with `EVAL`.
+    RdNoScript(sha: Str)
+    // `LOADING`: the server is reading its dataset from disk and is
+    // not answering yet.  A restart, not a failure.
+    RdLoading
+    // `CLUSTERDOWN`: not enough of the cluster is reachable to serve
+    // the slot.
+    RdClusterDown(detail: Str)
+    // `READONLY`: this node is a replica and the command writes.
+    RdReadOnly
+    // `NOAUTH` or `WRONGPASS`: the connection has not authenticated.
+    RdNotAuthenticated(detail: Str)
+    // The socket could not be opened.
+    RdConnectFailed(host: Str, port: Int, detail: Str)
+    // The connection went away mid-exchange.
+    RdConnectionLost(during: Str)
+    // A frame did not decode: a type byte this codec does not know, a
+    // length that is not a number, a missing CRLF, a bulk string
+    // shorter than its declared length.
+    RdBadFrame(offset: Int, detail: Str)
+    // A frame declared a length larger than the caller's ceiling.  The
+    // ceiling is the caller's because a value can legitimately be 512
+    // megabytes, and the length field is a number the wire supplies.
+    RdFrameTooLarge(declared: Int, limit: Int)
+    // A reply that decoded but is not the shape the command's typed
+    // wrapper promised — a `GET` that answered an array.  Carries both
+    // so a report says what it wanted and what it got.
+    RdUnexpectedReply(want: Str, got: Str)
+    // The server answered RESP2 where RESP3 was required — a push
+    // type, an attribute, or a map — or `HELLO 3` was refused.
+    RdProtocolTooOld(feature: Str)
+    // A deadline passed.
+    RdTimedOut(operation: Str, ms: Int)
+    // A command was built with a shape Redis cannot parse: no
+    // arguments at all, or a key where the command wants none.
+    RdBadCommand(detail: Str)
+
+// One line naming what went wrong, for a report a person reads.
+//
+// ```novo
+// use rderror
+//
+// fn main() [io]
+//     println(rderror.describe(rderror.RdLoading))
+// ```
+pub fn describe(f: RdFault) -> Str
+    todo("redis-nv.rderror.describe")
+
+// Turn an error reply's text into a fault, splitting the code word
+// from the prose and recognising the four that are instructions.
+//
+// THE FUNCTION THE MODULE COMMENT EXISTS FOR.  A client that did not
+// do this surfaces `MOVED` to its caller as an error from Redis, and
+// the caller — who asked for a key and got told where it lives —
+// cannot do anything with that.
+//
+// ```novo
+// use rderror
+//
+// fn main() [io]
+//     match rderror.of_error_reply("MOVED 3999 127.0.0.1:6381")
+//         RdMoved(s, h, p) => println("slot ${s} is on ${h}")
+//         f                => println("something else")
+// ```
+pub fn of_error_reply(text: Str) -> RdFault
+    todo("redis-nv.rderror.of_error_reply")
+
+// The code word at the front of an error reply, or empty when it has
+// none.
+//
+// A convention rather than a rule — nothing stops a Lua script from
+// raising an error whose first word is lowercase prose — so this
+// answers empty rather than guessing.
+//
+// ```novo
+// use rderror
+//
+// fn main() [io]
+//     println(rderror.error_code("WRONGTYPE Operation against a key"))
+// ```
+pub fn error_code(text: Str) -> Str
+    todo("redis-nv.rderror.error_code")
+
+// True when this fault is an INSTRUCTION rather than a failure: a
+// redirection, a missing script, a retry, or a server still loading.
+//
+// The predicate a client's own retry logic branches on, and the one
+// that separates "handle this and carry on" from "tell the caller".
+//
+// ```novo
+// use rderror
+//
+// fn main() [io]
+//     println("${rderror.is_instruction(rderror.RdMoved(slot: 1, host: "h", port: 1))}")
+// ```
+pub fn is_instruction(f: RdFault) -> Bool
+    todo("redis-nv.rderror.is_instruction")
+
+// True when the connection is no longer usable and has to be
+// discarded rather than reused.
+//
+// A lost connection or a protocol desynchronisation.  A `WRONGTYPE`
+// or a `MOVED` does NOT make a connection unusable, and a client that
+// reconnected on every one of those reconnects constantly under
+// normal operation.
+pub fn is_fatal(f: RdFault) -> Bool
+    todo("redis-nv.rderror.is_fatal")
+
+// True when resending the same command shortly is worth doing:
+// `TRYAGAIN`, `LOADING`, `CLUSTERDOWN`, a lost connection.
+//
+// NOT `MOVED` or `ASK`, which are worth resending to a DIFFERENT
+// place — `rdcluster` is what does that, and collapsing the two would
+// make a client resend a redirect to the node that redirected it.
+pub fn is_retryable(f: RdFault) -> Bool
+    todo("redis-nv.rderror.is_retryable")

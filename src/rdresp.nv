@@ -1,0 +1,342 @@
+// rdresp.nv — RESP2 and RESP3 as bytes in and frames out, and frames
+// in and bytes out.  No socket anywhere in it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE PACKAGE'S LOAD-BEARING INTERFACE, and it is one
+// enum and one predicate: `RdFrame`, and `is_push`.
+//
+// WHY `is_push` IS THE PREDICATE THE WHOLE CLIENT TURNS ON.  In RESP2
+// a pub/sub message arrives as an ordinary ARRAY — `["message", chan,
+// payload]` — which is indistinguishable from an array REPLY to a
+// command.  A client cannot tell one from the other, which is exactly
+// why Redis FORBIDS a subscribed RESP2 connection from running any
+// other command: the ambiguity is unresolvable, so the protocol
+// removes the case.
+//
+// RESP3 fixes it with a distinct type: a push frame begins `>` and is
+// not a reply to anything.  That is what lets one connection carry
+// commands and subscriptions at once, and it is what invalidations,
+// client tracking and monitoring all ride on.  A client that decoded
+// `>` and then paired it with the next pending command has answered
+// that command with somebody else's message AND left every later
+// reply off by one — a failure that starts one subscription after the
+// bug and never stops.
+//
+// So: `is_push` is public, `RdPush` is its own variant, and the
+// client's read loop routes on it before it looks for a reply.
+//
+// THE TWO PROTOCOLS ARE ONE DECODER.  RESP3 adds seven types to
+// RESP2's five and changes nothing about the five.  A server speaks
+// RESP2 until a client sends `HELLO 3`, so a decoder that only knew
+// RESP3 could not read the reply to the `HELLO` that asks for it.
+// One decoder that knows all twelve is therefore not a convenience:
+// it is the only shape that can perform the negotiation.
+//
+// THE TYPE BYTES, all twelve:
+//
+//   RESP2   +  simple string      -  error       :  integer
+//           $  bulk string        *  array
+//   RESP3   _  null               ,  double      #  boolean
+//           !  bulk error         =  verbatim string
+//           (  big number         %  map         ~  set
+//           >  push               |  attribute
+//
+// A NULL IS NOT AN EMPTY STRING AND RESP2 SPELLS IT TWICE.  `$-1\r\n`
+// is a null bulk string and `*-1\r\n` is a null array, and RESP3
+// replaces both with `_\r\n`.  All three decode to `RdNull` here,
+// because the distinction was never meaningful to a caller and
+// keeping it would make every consumer match three variants for one
+// idea.  The ENCODER keeps it: `encode_null` takes the protocol,
+// because a server written against this codec has to send what its
+// client understands.
+//
+// AN ATTRIBUTE IS METADATA ON THE NEXT FRAME AND IS NOT THE REPLY.
+// `|` introduces a map that annotates whatever follows it — key
+// popularity, replica offsets — and a decoder that returned it as the
+// reply hands back a map where a value should be.  `RdFrame` carries
+// it as a FIELD on the frame it annotates rather than as a variant, so
+// there is no shape in which a caller can receive one by accident.
+
+use rderror
+
+// Which protocol a connection is speaking.
+//
+// A server speaks `RdResp2` until the client sends `HELLO 3`.
+pub enum RdProtocol
+    RdResp2
+    RdResp3
+
+// One RESP frame.
+//
+// THE PACKAGE'S LOAD-BEARING INTERFACE — see the module comment.
+pub enum RdFrame
+    // `+` — a short unstructured string: `OK`, `PONG`, `QUEUED`.
+    RdSimple(v: Str)
+    // `-` and `!` — an error.  The code word and the prose are split
+    // by `rderror.of_error_reply`, not here: this is the wire's shape
+    // and that is the meaning.
+    RdError(v: Str)
+    // `:` — a 64-bit signed integer.
+    RdInt(v: Int)
+    // `$` — a length-prefixed byte string.  BYTES and not `Str`: a
+    // Redis value is arbitrary binary and a `Str` would make a JPEG
+    // stored under a key unreadable.
+    RdBulk(v: Bytes)
+    // `*` — an array of frames.
+    RdArray(v: [RdFrame])
+    // `_`, `$-1`, `*-1` — the absent value, in all three spellings.
+    RdNull
+    // `,` — a double.  Carries `inf`, `-inf` and `nan`, which is why
+    // it is a distinct type from an integer rather than a string a
+    // client parses.
+    RdDouble(v: Float)
+    // `#` — `t` or `f`.
+    RdBool(v: Bool)
+    // `=` — a string with a three-character format hint and a colon
+    // on the front: `txt:`, `mkd:`.  The hint is stripped into
+    // `format` so a caller does not have to know it was there.
+    RdVerbatim(format: Str, v: Bytes)
+    // `(` — an integer too large for 64 bits, as its decimal text.
+    // NOT parsed: a client that needs the value takes it to
+    // `std.bigint`, and one that only logs it does not pay for that.
+    RdBigNumber(v: Str)
+    // `%` — a map, as alternating keys and values.  Parallel lists
+    // rather than a map type, because a map type in a published
+    // signature is a decision the implementation should get to make
+    // and because RESP map keys are frames rather than strings.
+    RdMap(keys: [RdFrame], values: [RdFrame])
+    // `~` — a set.  Distinct from an array on the wire and carrying
+    // the same shape; the difference is that the ORDER MEANS NOTHING,
+    // which is worth knowing before writing a test that depends on it.
+    RdSet(v: [RdFrame])
+    // `>` — a push: a message that is not a reply to anything.  THE
+    // VARIANT THE MODULE COMMENT IS ABOUT.
+    RdPush(v: [RdFrame])
+
+// A decoded frame, the attribute that annotated it, and how far the
+// decoder got.
+pub struct RdDecoded
+    frame: RdFrame
+    // The `|` attribute map that preceded this frame, if any — see
+    // the module comment.  Empty lists when there was none.
+    attribute_keys: [RdFrame]
+    attribute_values: [RdFrame]
+    // Bytes consumed.
+    bytes: Int
+
+// ── framing ──────────────────────────────────────────────────────────
+
+// How many bytes a complete frame at `offset` occupies, or `None`
+// when the buffer does not hold a whole one yet.
+//
+// THE FIRST THING A READ LOOP CALLS.  A socket read returns whatever
+// the kernel had, and for a pipelined client that is routinely
+// several replies and part of another.  This answers "is there a
+// whole one here" without decoding it and without copying, and it
+// recurses through an array's elements because an array is not
+// complete until its last element is.
+//
+// `max_bytes` is the caller's ceiling: a bulk string can legitimately
+// be 512 megabytes, and the length is a number the wire supplies.
+//
+// ```novo
+// use rdresp
+// use std.bytes
+//
+// fn main() [io]
+//     match rdresp.frame_length(bytes.zeros(0), 0, 1048576)
+//         Ok(n)  => println("maybe a whole frame")
+//         Err(_) => println("refused")
+// ```
+pub fn frame_length(buf: Bytes, offset: Int, max_bytes: Int) -> Result<?Int, rderror.RdFault>
+    todo("redis-nv.rdresp.frame_length")
+
+// Decode one frame.
+//
+// `buf` must hold a whole one — `frame_length` is what says so.  An
+// attribute frame is absorbed into `RdDecoded` rather than returned,
+// so a caller cannot receive one where a reply should be.
+//
+// ```novo
+// use rdresp
+// use std.bytes
+//
+// fn main() [io]
+//     match rdresp.decode(bytes.from_str("+OK\r\n"), 0, 1048576)
+//         Ok(d)  => println("decoded")
+//         Err(_) => println("not a frame")
+// ```
+pub fn decode(buf: Bytes, offset: Int, max_bytes: Int) -> Result<RdDecoded, rderror.RdFault>
+    todo("redis-nv.rdresp.decode")
+
+// Encode a frame to the bytes that go on the wire.
+//
+// Takes the protocol, because the RESP3 types have no RESP2 spelling:
+// encoding an `RdDouble` for a RESP2 peer is `RdProtocolTooOld`
+// rather than a silent downgrade to a bulk string, which would answer
+// a number where the peer expected one and be wrong only for `inf`.
+pub fn encode(f: RdFrame, protocol: RdProtocol) -> Result<Bytes, rderror.RdFault>
+    todo("redis-nv.rdresp.encode")
+
+// Encode the absent value for this protocol: `_\r\n` on RESP3, and
+// `$-1\r\n` on RESP2.
+//
+// Separate from `encode` because the RESP2 spelling depends on
+// whether a null BULK STRING or a null ARRAY was meant, and only the
+// caller knows which — see the module comment.
+//
+// ```novo
+// use rdresp
+// use std.bytes
+//
+// fn main() [io]
+//     println("${bytes.len(rdresp.encode_null(rdresp.RdResp3, false))}")
+// ```
+pub fn encode_null(protocol: RdProtocol, as_array: Bool) -> Bytes
+    todo("redis-nv.rdresp.encode_null")
+
+// ── the rule ─────────────────────────────────────────────────────────
+
+// True when this frame is a PUSH — a message that is not a reply to
+// anything.
+//
+// THE PREDICATE THE MODULE COMMENT EXISTS FOR, and the one a read
+// loop routes on before it looks for a reply.  A client that paired a
+// push with the next pending command answered that command with
+// somebody else's message and left every later reply off by one.
+//
+// ```novo
+// use rdresp
+//
+// fn main() [io]
+//     println("${rdresp.is_push(rdresp.RdPush(v: []))}")
+// ```
+pub fn is_push(f: RdFrame) -> Bool
+    todo("redis-nv.rdresp.is_push")
+
+// True when this frame is an error reply — `-` or `!`.
+pub fn is_error(f: RdFrame) -> Bool
+    todo("redis-nv.rdresp.is_error")
+
+// True when this frame TYPE exists only in RESP3.
+//
+// What `encode` checks before it sends to a RESP2 peer, and what a
+// server written against this codec checks before it answers one.
+//
+// ```novo
+// use rdresp
+//
+// fn main() [io]
+//     println("${rdresp.is_resp3_only(rdresp.RdDouble(v: 1.0))}")
+// ```
+pub fn is_resp3_only(f: RdFrame) -> Bool
+    todo("redis-nv.rdresp.is_resp3_only")
+
+// The type byte a frame is written as: `+`, `-`, `:`, `$`, `*`, `_`,
+// `,`, `#`, `=`, `(`, `%`, `~`, `>`.
+//
+// Published so an error message can say "a `>` where a reply was
+// expected" rather than "an unexpected frame".
+pub fn type_byte(f: RdFrame) -> Int
+    todo("redis-nv.rdresp.type_byte")
+
+// A one-word name for a frame's type, for a report and for
+// `RdUnexpectedReply`'s two fields.
+//
+// ```novo
+// use rdresp
+//
+// fn main() [io]
+//     println(rdresp.type_name(rdresp.RdNull))
+// ```
+pub fn type_name(f: RdFrame) -> Str
+    todo("redis-nv.rdresp.type_name")
+
+// ── reading a frame as what a command promised ───────────────────────
+
+// The frame as a byte string, or `RdUnexpectedReply`.
+//
+// `RdNull` answers `None` rather than a fault: a `GET` on a key that
+// is not there is the commonest thing that happens to a Redis client
+// and it is not an error.
+//
+// ```novo
+// use rdresp
+//
+// fn main() [io]
+//     match rdresp.as_bulk(rdresp.RdNull)
+//         Ok(v)  => println("a value or nothing")
+//         Err(_) => println("the wrong shape")
+// ```
+pub fn as_bulk(f: RdFrame) -> Result<?Bytes, rderror.RdFault>
+    todo("redis-nv.rdresp.as_bulk")
+
+// The frame as text.
+//
+// Convenience over `as_bulk`, and it does NOT validate UTF-8: a Redis
+// value is arbitrary binary, so this reinterprets rather than
+// checking, and a caller storing binary should use `as_bulk`.
+pub fn as_text(f: RdFrame) -> Result<?Str, rderror.RdFault>
+    todo("redis-nv.rdresp.as_text")
+
+// The frame as an integer.
+//
+// A `+OK`-shaped simple string is NOT an integer here.  Redis answers
+// `:1` where it means one, and accepting a string that happens to
+// parse would make a client that mis-read a reply carry on with a
+// plausible number.
+pub fn as_int(f: RdFrame) -> Result<Int, rderror.RdFault>
+    todo("redis-nv.rdresp.as_int")
+
+// The frame as a double, accepting RESP2's bulk-string spelling as
+// well as RESP3's `,`.
+//
+// The one place a string IS accepted where a number is wanted, and it
+// is because RESP2 has no double type at all: `ZSCORE` answers a bulk
+// string on RESP2 and a `,` on RESP3, and a caller should not have to
+// know which protocol it negotiated.
+pub fn as_double(f: RdFrame) -> Result<Float, rderror.RdFault>
+    todo("redis-nv.rdresp.as_double")
+
+// The frame as a boolean, accepting RESP2's `:0`/`:1` as well as
+// RESP3's `#`.
+pub fn as_bool(f: RdFrame) -> Result<Bool, rderror.RdFault>
+    todo("redis-nv.rdresp.as_bool")
+
+// The frame as a list of frames, accepting an array, a set or a push.
+pub fn as_list(f: RdFrame) -> Result<[RdFrame], rderror.RdFault>
+    todo("redis-nv.rdresp.as_list")
+
+// The frame as alternating keys and values, accepting RESP3's `%` and
+// RESP2's flat array.
+//
+// THE OTHER PLACE THE TWO PROTOCOLS DIFFER AND A CALLER SHOULD NOT
+// CARE.  `HGETALL` answers a flat array of alternating field and
+// value on RESP2 and a map on RESP3; a client that only understood
+// one reads every other element as a key on the other.
+//
+// ```novo
+// use rdresp
+// use std.list
+//
+// fn main() [io]
+//     match rdresp.as_pairs(rdresp.RdArray(v: []))
+//         Ok(p)  => println("${list.len(p.keys)}")
+//         Err(_) => println("not pairs")
+// ```
+pub struct RdPairs
+    keys: [RdFrame]
+    values: [RdFrame]
+
+// Read a reply as pairs.
+pub fn as_pairs(f: RdFrame) -> Result<RdPairs, rderror.RdFault>
+    todo("redis-nv.rdresp.as_pairs")
+
+// The error a frame carries, as a fault, or `None` when it is not an
+// error.
+//
+// Runs the text through `rderror.of_error_reply`, so a `MOVED`
+// arrives as `RdMoved` and not as a string a caller has to parse.
+pub fn as_fault(f: RdFrame) -> ?rderror.RdFault
+    todo("redis-nv.rdresp.as_fault")

@@ -1,0 +1,299 @@
+// rdclient.nv — the socket, the `HELLO` handshake that negotiates
+// RESP3, and the read loop that routes a push before it looks for a
+// reply.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[net]` AND NOT `[io, net]`.  `std.net`'s free functions —
+// `net.connect`, `net.send_bytes`, `net.recv_bytes`, `net.close` —
+// declare `[net]` alone, so a client built on them costs `[net]`.
+// `[time]` appears on the calls that consult a deadline, which for
+// Redis means every blocking command.  No module here prints.
+//
+// THE READ LOOP ROUTES A PUSH BEFORE IT LOOKS FOR A REPLY, and that
+// is the whole of why `rdresp.is_push` is public.  On RESP3 a push
+// frame can arrive between any command and its reply — a pub/sub
+// message, a client-tracking invalidation, a monitor line — and a
+// client that paired it with the pending command answered that
+// command with somebody else's message AND left every later reply off
+// by one.  So `call` reads until it has a NON-push frame and queues
+// the pushes; `rdpubsub` is what drains them.
+//
+// RESP3 IS NEGOTIATED AND THE NEGOTIATION CAN FAIL BENIGNLY.  A
+// client that wants it sends `HELLO 3` first; a server older than
+// Redis 6 answers an error, because it does not know the command at
+// all.  That is not a failure — it is the discovery that this is a
+// RESP2 server — and `connect` treats it that way, settling on RESP2
+// and recording it in `RdConn.protocol`.  A client that treated the
+// error as a connection failure cannot talk to a Redis 5.
+//
+// PIPELINING IS THE LARGEST PERFORMANCE DECISION A REDIS CLIENT
+// MAKES, and it is one function.  N commands in one write and N
+// replies in one read turns N round trips into one; over a network
+// with a millisecond of latency that is the difference between a
+// thousand operations a second and a hundred thousand.  `pipeline` is
+// therefore not an advanced feature tucked away — it is beside `call`.
+//
+// A BLOCKING COMMAND HOLDS THE CONNECTION FOR ITS WHOLE TIMEOUT, and
+// that is the trap the socket deadline sets.  `BLPOP k 30` occupies
+// the connection for up to thirty seconds; a client whose socket read
+// timeout is five disconnects itself and reconnects, having lost the
+// pop.  `blocking_call` takes the command's own timeout and sets the
+// socket's deadline ABOVE it, which is the arithmetic every Redis
+// client eventually writes and most write once, wrongly.
+//
+// TLS IS A HOOK, as in postgres-nv and for the same reason: a driver
+// that chose a TLS implementation would choose it for every program
+// that links the driver.  Redis has no in-band TLS negotiation at all
+// — the port is either TLS or it is not — so the hook is simpler
+// here: the caller's transport is used from the first byte.
+
+use rdcmd
+use rderror
+use rdresp
+
+// How bytes get to the server and back.
+//
+// The seam TLS goes through.  The functions are NAMED FUNCTIONS and
+// not lambdas, which is the shape the rest of the grid uses.
+pub struct RdTransport
+    send: fn(Int, Bytes) -> ?rderror.RdFault
+    recv: fn(Int, Int) -> Result<Bytes, rderror.RdFault>
+    close: fn(Int) -> ?rderror.RdFault
+
+// Where and as whom to connect.
+pub struct RdConnectOptions
+    host: Str
+    port: Int
+    // Empty for no authentication.  A user name as well as a password
+    // is Redis 6 and later; a password alone is the older form and
+    // `rdcmd.auth` sends whichever is right.
+    user: Str
+    password: Str
+    // Which numbered database to `SELECT`.  Does not exist in cluster
+    // mode — see `rdcmd.select_db`.
+    database: Int
+    // Ask for RESP3 with `HELLO 3`.  A server that does not know the
+    // command leaves the connection on RESP2 and that is not an error
+    // — see the module comment.
+    want_resp3: Bool
+    // Sent with `HELLO`, and what `CLIENT LIST` shows.  A client that
+    // leaves it empty is one nobody can find when it is the one
+    // holding the connection.
+    client_name: Str
+    // Refuse a frame larger than this.  A Redis value can
+    // legitimately be 512 megabytes, so the ceiling is the caller's.
+    max_frame_bytes: Int
+    connect_timeout_ms: Int
+    read_timeout_ms: Int
+
+// An open connection.
+pub struct RdConn
+    handle: Int
+    transport: RdTransport
+    options: RdConnectOptions
+    // What the `HELLO` settled on.
+    protocol: rdresp.RdProtocol
+    // The server's version, from `HELLO`'s reply or from `INFO`.
+    // Carried because half of Redis's behaviour differences are
+    // version differences and a report that does not say the version
+    // is a report nobody can act on.
+    server_version: Str
+    // Bytes read and not yet framed.  A socket read is not a frame,
+    // and for a pipelined client it is routinely several and part of
+    // another.
+    inbox: Bytes
+    // Push frames that arrived while a reply was being read — see the
+    // module comment.  Queued rather than dropped.
+    pushes: [rdresp.RdFrame]
+    // True once the connection is unusable.
+    broken: Bool
+
+// A connection and a reply.
+pub struct RdReplied
+    conn: RdConn
+    reply: rdresp.RdFrame
+
+// A connection and several replies, in the order the commands went
+// out.
+pub struct RdRepliedMany
+    conn: RdConn
+    replies: [rdresp.RdFrame]
+
+// ── transports and options ───────────────────────────────────────────
+
+// The plaintext transport over `std.net`.
+//
+// ```novo
+// use rdclient
+//
+// fn main() [io]
+//     let t = rdclient.plain_transport()
+//     println("ready")
+// ```
+pub fn plain_transport() -> RdTransport
+    todo("redis-nv.rdclient.plain_transport")
+
+// Sensible options for a local server: 127.0.0.1, port 6379, database
+// 0, RESP3 wanted, a 512-megabyte frame ceiling and a five-second
+// connect deadline.
+//
+// ```novo
+// use rdclient
+//
+// fn main() [io]
+//     println("${rdclient.default_options().port}")
+// ```
+pub fn default_options() -> RdConnectOptions
+    todo("redis-nv.rdclient.default_options")
+
+// ── connecting ───────────────────────────────────────────────────────
+
+// Open a connection: socket, `HELLO`, authentication and `SELECT`.
+//
+// Settles the protocol — see the module comment — and answers a
+// connection that is ready for commands.
+//
+// ```novo
+// use rdclient
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Ok(c)  => println(c.server_version)
+//         Err(_) => println("could not connect")
+// ```
+pub fn connect(o: RdConnectOptions, t: RdTransport) -> Result<RdConn, rderror.RdFault> [net, time]
+    todo("redis-nv.rdclient.connect")
+
+// Close the connection.
+pub fn close(c: RdConn) -> ?rderror.RdFault [net]
+    todo("redis-nv.rdclient.close")
+
+// Which protocol the connection settled on.
+//
+// A caller that has to know — one reading a `HGETALL`, say — asks
+// this rather than assuming, although `rdresp.as_pairs` is what
+// removes the need in that particular case.
+pub fn protocol_of(c: RdConn) -> rdresp.RdProtocol
+    todo("redis-nv.rdclient.protocol_of")
+
+// ── commands ─────────────────────────────────────────────────────────
+
+// Send one command and read its reply.
+//
+// Routes any push that arrives on the way into `RdConn.pushes` — see
+// the module comment — and turns an error reply into a fault, so a
+// `MOVED` arrives as `rderror.RdMoved` rather than as a string.
+//
+// ```novo
+// use rdclient
+// use rdcmd
+// use rdresp
+// use std.bytes
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match rdclient.call(c, rdcmd.get(bytes.from_str("k")))
+//                 Ok(r)  => println(rdresp.type_name(r.reply))
+//                 Err(_) => println("failed")
+// ```
+pub fn call(c: RdConn, cmd: rdcmd.RdCommand) -> Result<RdReplied, rderror.RdFault> [net, time]
+    todo("redis-nv.rdclient.call")
+
+// Send several commands in ONE write and read all their replies.
+//
+// THE LARGEST PERFORMANCE DECISION A REDIS CLIENT MAKES — see the
+// module comment.  A command that failed is an error FRAME in its own
+// slot rather than ending the batch: Redis has no equivalent of
+// PostgreSQL's discard-until-sync rule, every command in a pipeline
+// runs, and every one of them answers.
+//
+// ```novo
+// use rdclient
+// use rdcmd
+// use std.list
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             match rdclient.pipeline(c, [rdcmd.ping(""), rdcmd.ping("")])
+//                 Ok(r)  => println("${list.len(r.replies)}")
+//                 Err(_) => println("failed")
+// ```
+pub fn pipeline(c: RdConn,
+                cmds: [rdcmd.RdCommand]) -> Result<RdRepliedMany, rderror.RdFault> [net, time]
+    todo("redis-nv.rdclient.pipeline")
+
+// Send a command whose own timeout may exceed the socket's, and wait
+// for it properly.
+//
+// THE ARITHMETIC EVERY REDIS CLIENT EVENTUALLY WRITES — see the
+// module comment.  `BLPOP k 30` holds the connection for up to thirty
+// seconds, and a client whose read deadline is five disconnects
+// itself.  This sets the socket's deadline above the command's and
+// restores it afterwards.
+//
+// `command_timeout_ms` of zero means the command blocks forever,
+// which Redis allows and which this call therefore also allows — with
+// no socket deadline at all, deliberately.
+//
+// ```novo
+// use rdclient
+// use rdcmd
+// use std.bytes
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  =>
+//             let cmd = rdcmd.blocking_pop([bytes.from_str("q")], rdcmd.RdLeft, 30000)
+//             match rdclient.blocking_call(c, cmd, 30000)
+//                 Ok(r)  => println("popped or timed out")
+//                 Err(_) => println("failed")
+// ```
+pub fn blocking_call(c: RdConn, cmd: rdcmd.RdCommand,
+                     command_timeout_ms: Int) -> Result<RdReplied, rderror.RdFault> [net, time]
+    todo("redis-nv.rdclient.blocking_call")
+
+// Send a command and do NOT read its reply.
+//
+// The half of pipelining a caller builds its own batching on, and the
+// only way to write a command whose reply arrives much later.  A
+// caller that uses it owes a matching `read_reply`, and a connection
+// with a pending write that is never read is one whose next reply
+// belongs to the previous command.
+pub fn send(c: RdConn, cmd: rdcmd.RdCommand) -> Result<RdConn, rderror.RdFault> [net]
+    todo("redis-nv.rdclient.send")
+
+// Read one reply, routing pushes.
+pub fn read_reply(c: RdConn) -> Result<RdReplied, rderror.RdFault> [net, time]
+    todo("redis-nv.rdclient.read_reply")
+
+// ── what arrived on its own ──────────────────────────────────────────
+
+// The push frames that have arrived and not been taken.
+//
+// A caller that is not subscribed still gets these — client
+// tracking's invalidation messages arrive on an ordinary connection —
+// so a client that never drains them accumulates them.  `rdpubsub` is
+// the surface that makes sense of them.
+//
+// ```novo
+// use rdclient
+// use std.list
+//
+// fn main() [io, net, time]
+//     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
+//         Err(_) => println("no")
+//         Ok(c)  => println("${list.len(rdclient.take_pushes(c).pushes)}")
+// ```
+pub struct RdPushes
+    conn: RdConn
+    pushes: [rdresp.RdFrame]
+
+// Take the queued pushes, leaving the queue empty.
+pub fn take_pushes(c: RdConn) -> RdPushes
+    todo("redis-nv.rdclient.take_pushes")

@@ -1,0 +1,308 @@
+// rdresp_tests.nv — the twelve type bytes, the push that is not a
+// reply, and the three spellings of nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: redis-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE TYPE BYTES ARE ASSERTED AS CHARACTERS because they are
+// characters in the RESP specification and have not changed: `+`, `-`,
+// `:`, `$` and `*` since 2009, and the seven RESP3 ones since Redis 6.
+// A decoder that got one wrong misframes the stream from that byte on.
+
+use std.test
+use std.bytes
+use rderror
+use rdresp
+
+@test
+fn test_the_five_resp2_type_bytes() [io]
+    test.case("a simple string is a plus")
+    test.assert(rdresp.type_byte(rdresp.RdSimple(v: "OK")) == 0x2B)
+
+    test.case("an error is a minus")
+    test.assert(rdresp.type_byte(rdresp.RdError(v: "ERR")) == 0x2D)
+
+    test.case("an integer is a colon")
+    test.assert(rdresp.type_byte(rdresp.RdInt(v: 1)) == 0x3A)
+
+    test.case("a bulk string is a dollar")
+    test.assert(rdresp.type_byte(rdresp.RdBulk(v: bytes.zeros(0))) == 0x24)
+
+    test.case("and an array is a star")
+    test.assert(rdresp.type_byte(rdresp.RdArray(v: [])) == 0x2A)
+
+    test.case("none of the five is RESP3-only")
+    test.assert(rdresp.is_resp3_only(rdresp.RdSimple(v: "OK")) == false)
+    test.assert(rdresp.is_resp3_only(rdresp.RdArray(v: [])) == false)
+
+@test
+fn test_the_seven_resp3_type_bytes_and_which_are_new() [io]
+    test.case("null is an underscore")
+    test.assert(rdresp.type_byte(rdresp.RdNull) == 0x5F)
+
+    test.case("a double is a comma")
+    test.assert(rdresp.type_byte(rdresp.RdDouble(v: 1.0)) == 0x2C)
+
+    test.case("a boolean is a hash")
+    test.assert(rdresp.type_byte(rdresp.RdBool(v: true)) == 0x23)
+
+    test.case("a verbatim string is an equals")
+    test.assert(rdresp.type_byte(rdresp.RdVerbatim(format: "txt", v: bytes.zeros(0))) == 0x3D)
+
+    test.case("a big number is an open paren")
+    test.assert(rdresp.type_byte(rdresp.RdBigNumber(v: "1")) == 0x28)
+
+    test.case("a map is a percent and a set is a tilde")
+    test.assert(rdresp.type_byte(rdresp.RdMap(keys: [], values: [])) == 0x25)
+    test.assert(rdresp.type_byte(rdresp.RdSet(v: [])) == 0x7E)
+
+    test.case("and a push is a greater-than")
+    test.assert(rdresp.type_byte(rdresp.RdPush(v: [])) == 0x3E)
+
+    test.case("every one of them is RESP3-only")
+    test.assert(rdresp.is_resp3_only(rdresp.RdDouble(v: 1.0)))
+    test.assert(rdresp.is_resp3_only(rdresp.RdMap(keys: [], values: [])))
+    test.assert(rdresp.is_resp3_only(rdresp.RdSet(v: [])))
+    test.assert(rdresp.is_resp3_only(rdresp.RdPush(v: [])))
+
+@test
+fn test_a_push_is_not_a_reply() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A client that paired a push
+    // with the next pending command answered that command with
+    // somebody else's message AND left every later reply off by one —
+    // a failure that starts one subscription after the bug and never
+    // stops.
+    test.case("a push says so")
+    test.assert(rdresp.is_push(rdresp.RdPush(v: [])))
+
+    test.case("and an array — which is what a RESP2 message looks like — does not")
+    test.assert(rdresp.is_push(rdresp.RdArray(v: [])) == false)
+
+    test.case("nothing else does either")
+    test.assert(rdresp.is_push(rdresp.RdSimple(v: "OK")) == false)
+    test.assert(rdresp.is_push(rdresp.RdNull) == false)
+
+    test.case("an error is its own question")
+    test.assert(rdresp.is_error(rdresp.RdError(v: "ERR x")))
+    test.assert(rdresp.is_error(rdresp.RdSimple(v: "OK")) == false)
+
+    test.case("and the names are readable, for the message when the shape is wrong")
+    test.assert(rdresp.type_name(rdresp.RdPush(v: [])) != rdresp.type_name(rdresp.RdArray(v: [])))
+
+@test
+fn test_a_socket_read_is_not_a_frame() [io]
+    // For a pipelined client a read is routinely several replies and
+    // part of another.
+    test.case("an empty buffer holds no whole frame")
+    match rdresp.frame_length(bytes.zeros(0), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert_none(n)
+
+    test.case("a type byte with no terminator does not either")
+    match rdresp.frame_length(bytes.from_str("+OK"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert_none(n)
+
+    test.case("a complete simple string does")
+    match rdresp.frame_length(bytes.from_str("+OK\r\n"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            match n
+                Some(len) => test.assert(len == 5)
+                None      => test.assert(false)
+
+    test.case("and it decodes to what it says")
+    match rdresp.decode(bytes.from_str("+OK\r\n"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            test.assert(d.bytes == 5)
+            match d.frame
+                RdSimple(v) => test.assert(v == "OK")
+                _           => test.assert(false)
+
+@test
+fn test_a_length_is_the_caller_s_budget() [io]
+    // A Redis value can legitimately be 512 megabytes, and the length
+    // is a number the wire supplies.
+    test.case("a frame past the ceiling is refused rather than allocated")
+    match rdresp.frame_length(bytes.from_str("$100\r\n"), 0, 10)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and bytes that are not a frame are refused, not guessed")
+    match rdresp.decode(bytes.from_str("?\r\n"), 0, 1048576)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_three_spellings_of_nothing_all_decode_to_one() [io]
+    // `$-1` is a null bulk string, `*-1` a null array, `_` RESP3's
+    // null.  The distinction was never meaningful to a caller.
+    test.case("RESP2's null bulk string")
+    match rdresp.decode(bytes.from_str("$-1\r\n"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            match d.frame
+                RdNull => test.assert(true)
+                _      => test.assert(false)
+
+    test.case("RESP2's null array")
+    match rdresp.decode(bytes.from_str("*-1\r\n"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            match d.frame
+                RdNull => test.assert(true)
+                _      => test.assert(false)
+
+    test.case("and RESP3's null")
+    match rdresp.decode(bytes.from_str("_\r\n"), 0, 1048576)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            match d.frame
+                RdNull => test.assert(true)
+                _      => test.assert(false)
+
+    test.case("but the ENCODER keeps the distinction, because a peer has to understand it")
+    test.assert(bytes.len(rdresp.encode_null(rdresp.RdResp3, false)) == 3)
+    test.assert(bytes.len(rdresp.encode_null(rdresp.RdResp2, false)) == 5)
+    test.assert(bytes.to_hex(rdresp.encode_null(rdresp.RdResp2, false))
+                != bytes.to_hex(rdresp.encode_null(rdresp.RdResp2, true)))
+
+@test
+fn test_a_resp3_type_is_not_silently_downgraded_for_a_resp2_peer() [io]
+    // Encoding a double as a bulk string would answer a number where
+    // the peer expected one and be wrong only for `inf`.
+    test.case("RESP3 accepts a double")
+    match rdresp.encode(rdresp.RdDouble(v: 1.5), rdresp.RdResp3)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.assert(false)
+
+    test.case("and RESP2 refuses one")
+    match rdresp.encode(rdresp.RdDouble(v: 1.5), rdresp.RdResp2)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("both accept the five that predate RESP3")
+    match rdresp.encode(rdresp.RdInt(v: 1), rdresp.RdResp2)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_reply_is_read_as_what_the_command_promised() [io]
+    test.case("a missing key is None and not an error")
+    match rdresp.as_bulk(rdresp.RdNull)
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_none(v)
+
+    test.case("a value is Some")
+    match rdresp.as_bulk(rdresp.RdBulk(v: bytes.from_str("v")))
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_some(v)
+
+    test.case("and the wrong shape is a fault naming both")
+    match rdresp.as_int(rdresp.RdBulk(v: bytes.from_str("1")))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("an integer reads as an integer")
+    match rdresp.as_int(rdresp.RdInt(v: 7))
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 7)
+
+    test.case("text is a reinterpretation and does not validate UTF-8")
+    match rdresp.as_text(rdresp.RdBulk(v: bytes.from_str("v")))
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert_some(v)
+
+    test.case("and a list accepts an array, a set or a push")
+    match rdresp.as_list(rdresp.RdSet(v: []))
+        Ok(l)  => test.assert(true)
+        Err(_) => test.assert(false)
+    match rdresp.as_list(rdresp.RdPush(v: []))
+        Ok(l)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_two_places_a_caller_should_not_know_which_protocol_it_got() [io]
+    // ZSCORE answers a bulk string on RESP2 and a `,` on RESP3;
+    // HGETALL a flat array on RESP2 and a map on RESP3.
+    test.case("a double reads from either spelling")
+    match rdresp.as_double(rdresp.RdDouble(v: 1.5))
+        Err(_) => test.assert(false)
+        Ok(f)  => test.assert(f > 1.0)
+    match rdresp.as_double(rdresp.RdBulk(v: bytes.from_str("1.5")))
+        Err(_) => test.assert(false)
+        Ok(f)  => test.assert(f > 1.0)
+
+    test.case("a boolean reads from either spelling")
+    match rdresp.as_bool(rdresp.RdBool(v: true))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(b)
+    match rdresp.as_bool(rdresp.RdInt(v: 1))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(b)
+
+    test.case("and pairs read from a map or from a flat array")
+    match rdresp.as_pairs(rdresp.RdMap(keys: [], values: []))
+        Ok(p)  => test.assert(true)
+        Err(_) => test.assert(false)
+    match rdresp.as_pairs(rdresp.RdArray(v: []))
+        Ok(p)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_an_error_reply_becomes_a_fault_and_the_four_instructions_are_separated() [io]
+    // A client that surfaced MOVED as "an error from Redis" turned a
+    // routine part of the protocol into an application failure.
+    test.case("a MOVED is a redirection, with its slot and its node")
+    match rderror.of_error_reply("MOVED 3999 127.0.0.1:6381")
+        RdMoved(s, h, p) =>
+            test.assert(s == 3999)
+            test.assert(h == "127.0.0.1")
+            test.assert(p == 6381)
+        _                => test.assert(false)
+
+    test.case("an ASK is a DIFFERENT redirection")
+    match rderror.of_error_reply("ASK 3999 127.0.0.1:6381")
+        RdAsk(s, h, p) => test.assert(s == 3999)
+        _              => test.assert(false)
+
+    test.case("a NOSCRIPT names the digest")
+    match rderror.of_error_reply("NOSCRIPT No matching script")
+        RdNoScript(sha) => test.assert(true)
+        _               => test.assert(false)
+
+    test.case("a WRONGTYPE is its own variant, because it is a caller bug")
+    match rderror.of_error_reply("WRONGTYPE Operation against a key holding the wrong kind of value")
+        RdWrongType(c) => test.assert(true)
+        _              => test.assert(false)
+
+    test.case("and an ordinary error keeps its code and its prose")
+    match rderror.of_error_reply("ERR unknown command 'FOO'")
+        RdServerError(code, msg) => test.assert(code == "ERR")
+        _                        => test.assert(false)
+
+    test.case("the code word is readable on its own")
+    test.assert(rderror.error_code("WRONGTYPE Operation against") == "WRONGTYPE")
+
+    test.case("the four are instructions and an ordinary error is not")
+    test.assert(rderror.is_instruction(rderror.RdMoved(slot: 1, host: "h", port: 1)))
+    test.assert(rderror.is_instruction(rderror.RdNoScript(sha: "x")))
+    test.assert(rderror.is_instruction(rderror.RdServerError(code: "ERR", message: "x")) == false)
+
+    test.case("a MOVED is NOT retryable in place — it is retryable ELSEWHERE")
+    test.assert(rderror.is_retryable(rderror.RdMoved(slot: 1, host: "h", port: 1)) == false)
+    test.assert(rderror.is_retryable(rderror.RdTryAgain(command: "MGET")))
+    test.assert(rderror.is_retryable(rderror.RdLoading))
+
+    test.case("and a WRONGTYPE does not break the connection")
+    test.assert(rderror.is_fatal(rderror.RdWrongType(command: "GET")) == false)
+    test.assert(rderror.is_fatal(rderror.RdConnectionLost(during: "call")))
+
+    test.case("every fault renders to something a person can read")
+    test.assert(rderror.describe(rderror.RdReadOnly) != "")
+
+    test.case("and a frame carries its fault out")
+    test.assert_some(rdresp.as_fault(rdresp.RdError(v: "ERR x")))
+    test.assert_none(rdresp.as_fault(rdresp.RdSimple(v: "OK")))

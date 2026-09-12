@@ -1,0 +1,68 @@
+[package]
+name        = "redis-nv"
+version     = "0.0.1"
+description = "A Redis client with RESP2 and RESP3 as a codec that performs nothing: every frame type including the push type and attributes, typed commands for the string, hash, list, set, sorted-set and stream families beside a generic escape hatch, pipelining, pub/sub as a value the host pumps, MULTI/EXEC, EVAL with local SHA caching, and cluster redirection.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and four of the eight modules are `[]` throughout: `rdresp`
+# (bytes in, frames out, frames in, bytes out), `rdcmd` (a command is
+# a list of byte strings and building one performs nothing),
+# `rdcluster`'s slot arithmetic, and `rderror`.
+#
+# `rdclient`, `rdpubsub`, `rdtx` and `rdscript` connect, and declare
+# `[net]` — and `[time]` on the calls that consult a deadline, which
+# is every blocking command Redis has and the subscription pump.  No
+# module here prints.
+#
+# The `core` half is a MODULE split and NOT a package split, and
+# unlike postgres-nv this one has a second caller in sight: a RESP
+# SERVER.  `rdresp` decodes and encodes in both directions already —
+# a frame is a frame whichever end sent it — so if `orbit/novokv` ever
+# grows a RESP front door (see the README), the codec moves out as
+# `resp-nv` with no signature change and both ends take it.  Named
+# here so that is a decision waiting rather than an omission.
+layer       = "host"
+
+category    = "databases"
+
+tags        = ["redis", "resp", "resp3", "cache", "pubsub", "cluster", "valkey", "native-port"]
+repository  = "https://github.com/novolang/redis-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "RESP2 and RESP3, and the frame that is not a reply"
+
+[dependencies]
+# crypto-nv, for SHA-1 and for one reason: `EVALSHA`.
+#
+# A client can get a script's digest from the server by sending
+# `SCRIPT LOAD` — which costs a round trip, on a connection, before
+# the script can be used.  Computing it locally is what lets a client
+# send `EVALSHA` OPTIMISTICALLY and fall back to `EVAL` on `NOSCRIPT`,
+# which is the pattern every Redis client settled on because it costs
+# zero round trips in the steady state.  `hashing.sha1` is the whole
+# of what this package uses it for.
+crypto-nv = "^0.1.1"
+
+# NOT crc-nv, and the absence is a gap in crc-nv rather than a design
+# decision here.  Redis Cluster's key slot is CRC-16/XMODEM — poly
+# 0x1021, init 0x0000, no reflection, no final xor — mod 16384.
+# crc-nv publishes CRC-16/CCITT-FALSE, which is the SAME polynomial
+# with an initial value of 0xffff, and CRC-16/MODBUS, which is a
+# different polynomial reflected; neither is XMODEM, and crc-nv has no
+# public constructor taking a parameter set, so XMODEM cannot be built
+# from its surface.  `rdcluster.key_slot` therefore carries the table,
+# and the row this asks for is a `crc.custom(poly, init, xor_out,
+# width, reflected)` on crc-nv — after which this package takes the
+# dependency and deletes its table.  The README says so.

@@ -1,0 +1,218 @@
+// rdscript.nv — `EVAL` and `EVALSHA`, and the optimistic pattern that
+// makes the second one worth having.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE PATTERN IS SEND-THE-DIGEST-AND-FALL-BACK, and it is the whole
+// reason this module exists rather than a `command(["EVAL", …])`.  A
+// script's body may be kilobytes; its SHA-1 digest is forty
+// characters.  Sending the digest costs one round trip and almost
+// always works, because the server caches every script it has ever
+// run; when it does not, the server answers `NOSCRIPT` and the client
+// sends the body.  Steady state: one round trip and forty bytes.  The
+// alternative — `SCRIPT LOAD` first — costs a round trip EVERY TIME a
+// connection is new, which for a pooled client is every request after
+// a restart.
+//
+// SO THE DIGEST IS COMPUTED LOCALLY, which is the whole of what
+// crypto-nv is a dependency for.  `digest_of` is public because a
+// caller that wants to log which script ran, or key a cache on it,
+// needs the same forty characters.
+//
+// KEYS AND ARGUMENTS ARE DIFFERENT THINGS AND THE DIFFERENCE IS NOT
+// COSMETIC.  `EVAL <body> <numkeys> k1 k2 a1 a2` splits its arguments
+// by a COUNT, and everything before the count's worth is a KEY.  In a
+// cluster that is what decides which node runs the script; outside
+// one it is still what Redis's own documentation requires, because a
+// script that reached a key it did not declare is one that cannot be
+// routed and may be refused outright.  `RdScriptCall` therefore has
+// two lists and not one, and `rdcluster` routes on the first.
+//
+// A SCRIPT IS NOT A TRANSACTION EITHER, AND IT IS CLOSER TO ONE THAN
+// `MULTI` IS.  It runs atomically — nothing else runs while it does —
+// and it has no rollback: a script that fails halfway leaves its
+// earlier writes in place.  The difference from `MULTI` is that a
+// script can BRANCH on what it read, which is what it is for.
+//
+// FUNCTIONS (`FCALL`, Redis 7) ARE THE SUCCESSOR AND ARE DECLARED.
+// A function library is loaded once with `FUNCTION LOAD` and survives
+// a restart, which is the thing `EVALSHA` does not do; the call shape
+// is otherwise identical, so `fcall` sits beside `eval` rather than
+// in a module of its own.
+
+use rdcmd
+use rderror
+
+// A script and the keys and arguments it is called with.
+pub struct RdScriptCall
+    // The script's body, or empty when only the digest is being sent.
+    body: Str
+    // The forty-character lowercase hex digest.
+    sha: Str
+    // The KEYS the script touches.  Declared, not inferred — see the
+    // module comment.
+    keys: [Bytes]
+    // The arguments, which are not keys.
+    args: [Bytes]
+
+// What a client remembers about which scripts a server has.
+//
+// A VALUE, and per CONNECTION rather than per client: a server that
+// restarted has an empty script cache, and a client that shared one
+// cache across connections would send `EVALSHA` to a fresh server
+// forever and fall back every time.  The fallback is correct but the
+// round trip is wasted, and the waste is invisible.
+pub struct RdScriptCache
+    // Digests this connection has seen the server accept.
+    known: [Str]
+    // How many `EVALSHA` calls fell back to `EVAL`.  Counted because
+    // a number that keeps rising is a server that keeps restarting or
+    // a cache being flushed, and that is worth seeing.
+    fallbacks: Int
+
+// ── the digest ───────────────────────────────────────────────────────
+
+// The SHA-1 of a script body, as forty lowercase hex characters.
+//
+// WHAT crypto-nv IS A DEPENDENCY FOR — see the module comment.
+// Public because a caller logging which script ran, or keying its own
+// cache, needs the same forty characters.
+//
+// SHA-1 here is Redis's choice and is not a security claim: the
+// digest identifies a script in a cache the client itself populated,
+// and nothing is authenticated by it.
+//
+// ```novo
+// use rdscript
+//
+// fn main() [io]
+//     println(rdscript.digest_of("return 1"))
+// ```
+pub fn digest_of(body: Str) -> Str
+    todo("redis-nv.rdscript.digest_of")
+
+// A call from a body, with its digest computed.
+//
+// ```novo
+// use rdscript
+//
+// fn main() [io]
+//     println(rdscript.script("return 1", [], []).sha)
+// ```
+pub fn script(body: Str, keys: [Bytes], args: [Bytes]) -> RdScriptCall
+    todo("redis-nv.rdscript.script")
+
+// A call from a digest alone, for a script whose body the caller does
+// not have.
+//
+// The fallback to `EVAL` is then impossible, so a `NOSCRIPT` reaches
+// the caller as a fault rather than being handled.  That is the
+// honest outcome and the reason `script` is the one to prefer.
+pub fn script_by_digest(sha: Str, keys: [Bytes], args: [Bytes]) -> RdScriptCall
+    todo("redis-nv.rdscript.script_by_digest")
+
+// ── the cache ────────────────────────────────────────────────────────
+
+// An empty cache — what a fresh connection starts with.
+//
+// ```novo
+// use rdscript
+//
+// fn main() [io]
+//     println("${rdscript.cache().fallbacks}")
+// ```
+pub fn cache() -> RdScriptCache
+    todo("redis-nv.rdscript.cache")
+
+// True when this cache has seen the server accept this digest.
+//
+// What decides whether to send `EVALSHA` first or `EVAL` straight
+// away.  A cache that says no is not a reason to `SCRIPT LOAD`: the
+// `EVAL` carries the body and populates the server's cache as a side
+// effect, which is one round trip rather than two.
+pub fn is_known(c: RdScriptCache, sha: Str) -> Bool
+    todo("redis-nv.rdscript.is_known")
+
+// Record that the server accepted a digest.
+pub fn remember(c: RdScriptCache, sha: Str) -> RdScriptCache
+    todo("redis-nv.rdscript.remember")
+
+// Record that a digest was not known to the server, and that a
+// fallback happened.
+//
+// Forgets the digest as well as counting: a server that answered
+// `NOSCRIPT` once will answer it again until something sends the
+// body.
+pub fn forget(c: RdScriptCache, sha: Str) -> RdScriptCache
+    todo("redis-nv.rdscript.forget")
+
+// Empty the cache — what a client does when it reconnects, because
+// the server it reconnected to may not be the one it was talking to.
+pub fn invalidate(c: RdScriptCache) -> RdScriptCache
+    todo("redis-nv.rdscript.invalidate")
+
+// ── the commands ─────────────────────────────────────────────────────
+
+// `EVALSHA <sha> <numkeys> …` — the optimistic call.
+//
+// ```novo
+// use rdscript
+// use rdcmd
+//
+// fn main() [io]
+//     println(rdcmd.name_of(rdscript.evalsha(rdscript.script("return 1", [], []))))
+// ```
+pub fn evalsha(call: RdScriptCall) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.evalsha")
+
+// `EVAL <body> <numkeys> …` — the fallback, which also populates the
+// server's cache.
+pub fn eval(call: RdScriptCall) -> Result<rdcmd.RdCommand, rderror.RdFault>
+    todo("redis-nv.rdscript.eval")
+
+// `EVALSHA_RO` or `EVAL_RO` — the read-only forms, which a replica
+// will run and which a script that writes is refused for.
+//
+// Worth having as a separate call rather than a flag: a caller that
+// declares a script read-only and is wrong finds out immediately, and
+// a caller that wants to spread reads across replicas has to be able
+// to say which scripts may go there.
+pub fn eval_readonly(call: RdScriptCall,
+                     by_digest: Bool) -> Result<rdcmd.RdCommand, rderror.RdFault>
+    todo("redis-nv.rdscript.eval_readonly")
+
+// `SCRIPT LOAD` — cache a script without running it.
+//
+// The round trip the optimistic pattern exists to avoid, and still
+// the right call in one case: a client that wants to fail at STARTUP
+// if its scripts are malformed rather than on the first request.
+pub fn script_load(body: Str) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.script_load")
+
+// `SCRIPT EXISTS` — which of these digests the server has.
+pub fn script_exists(shas: [Str]) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.script_exists")
+
+// `SCRIPT FLUSH` — empty the server's cache.
+pub fn script_flush(asynchronous: Bool) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.script_flush")
+
+// ── functions ────────────────────────────────────────────────────────
+
+// `FCALL <name> <numkeys> …` — Redis 7's successor to `EVALSHA`.
+//
+// A function library is loaded once with `FUNCTION LOAD` and SURVIVES
+// A RESTART, which is the thing the script cache does not: no
+// `NOSCRIPT`, no fallback, no digest.  The call shape is otherwise
+// identical, which is why this sits beside `eval` rather than in a
+// module of its own.
+pub fn fcall(name: Str, keys: [Bytes], args: [Bytes]) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.fcall")
+
+// `FCALL_RO` — the read-only form.
+pub fn fcall_readonly(name: Str, keys: [Bytes], args: [Bytes]) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.fcall_readonly")
+
+// `FUNCTION LOAD` — install a library.
+pub fn function_load(code: Str, replace: Bool) -> rdcmd.RdCommand
+    todo("redis-nv.rdscript.function_load")
