@@ -1,6 +1,6 @@
 [package]
 name        = "redis-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "A Redis client with RESP2 and RESP3 as a codec that performs nothing: every frame type including the push type and attributes, typed commands for the string, hash, list, set, sorted-set and stream families beside a generic escape hatch, pipelining, pub/sub as a value the host pumps, MULTI/EXEC, EVAL with local SHA caching, and cluster redirection.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

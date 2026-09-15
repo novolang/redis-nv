@@ -1,300 +1,347 @@
 # redis-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+Redis is an in-memory data store used as a cache, a message broker and
+a database. Clients talk to it over **RESP**, the REdis Serialization
+Protocol, specified in Redis's own
+[protocol specification](https://redis.io/docs/latest/develop/reference/protocol-spec/).
+This package speaks RESP2 and RESP3 in novo-lang: a codec that
+performs nothing, and a client over `std.net` built on it. It covers
+the commands, pub/sub, transactions, Lua scripts and cluster routing.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is
+declared with its full signature, but every body is a `todo()` that
+panics when called. The package is published so its design can be
+reviewed and depended on before it is implemented. Version 0.1.0 will
+be the first working release.
 
-## What this is
+## What the protocol is
 
-A Redis client in novo-lang: RESP2 and RESP3 as a codec that performs
-nothing, and a client over `std.net` built on it.
+Everything on the wire is a **frame**: one type byte, then the frame's
+content, then a carriage return and a line feed. A client sends a
+**command** as an array of byte strings, and the server answers one
+frame.
 
-RESP is a small protocol — twelve type bytes and a length prefix — and
-the reason a client is more than an afternoon's work is not the parsing.
-It is the half-dozen rules that are invisible until they are wrong: a
-push that is not a reply, a `MOVED` that is not an error, a `SET` whose
-expiry option differs from another by one letter, a cluster slot whose
-CRC has a near-identical twin.  Each of those is a public function here,
-because each of them is a silent bug elsewhere.
+**RESP2** is the original protocol and has five types. **RESP3** adds
+seven more, and a server speaks RESP2 until the client sends
+`HELLO 3`.
 
-Eight modules, and a reader should know which one they are on.
-
-| surface | module | reach for it when |
+| Byte | Frame | Protocol |
 | --- | --- | --- |
-| the **frames** | `rdresp` | anything. Start here |
-| the **commands** | `rdcmd` | you are building something to send |
-| the **connection** | `rdclient` | you want to send it |
-| the **subscriptions** | `rdpubsub` | you are listening |
-| the **transactions** | `rdtx` | you are using `MULTI`/`WATCH` |
-| the **scripts** | `rdscript` | you are running Lua |
-| the **cluster** | `rdcluster` | there is more than one node |
-| the **faults** | `rderror` | something came back wrong |
+| `+` | A short unstructured string, such as `OK` or `PONG` | both |
+| `-` | An error | both |
+| `:` | A 64-bit signed integer | both |
+| `$` | A byte string with its length in front | both |
+| `*` | An array of frames | both |
+| `_` | The absent value; RESP2 spells it `$-1` or `*-1` | RESP3 |
+| `,` | A double, which carries `inf`, `-inf` and `nan` | RESP3 |
+| `#` | A boolean, `t` or `f` | RESP3 |
+| `=` | A string with a three-character format hint | RESP3 |
+| `(` | An integer too large for 64 bits, as decimal text | RESP3 |
+| `%` | A map, as alternating keys and values | RESP3 |
+| `~` | A set, whose order means nothing | RESP3 |
+| `>` | A **push** | RESP3 |
 
-## Adding it, and checking it
+**A push is not a reply.** It is a message the server sends because
+something happened, not because the client asked. Pub/sub messages,
+client-side caching invalidations and `MONITOR` output all arrive that
+way. A client that took a push for the reply to a pending command
+would answer that command with somebody else's message, and every
+later reply would be off by one, from that moment on.
 
-```bash
-novo pkg add redis-nv             # into your novo.toml
-novo pkg build                    # type- and effect-check the package
-novo test --isolate tests/rdresp_tests.nv
+In RESP2 there is no push type. A pub/sub message arrives as an
+ordinary array, which is indistinguishable from an array reply. That
+ambiguity cannot be resolved, so Redis forbids a subscribed RESP2
+connection from running any other command.
+
+Some error replies are **instructions rather than failures**. In a
+cluster, `MOVED` says the key's slot lives on another node and `ASK`
+says the slot is migrating. `NOSCRIPT` says a script's digest is not
+cached here. `LOADING` says the server is still reading its dataset
+from disk. Each of those is a routine step in a working client.
+
+A **cluster** divides the keyspace into 16,384 **slots**. A key's slot
+is the CRC-16/XMODEM of its **hash tag** modulo 16,384. The hash tag
+is the text between the first `{` and the first `}` after it, when
+that text is not empty, and the whole key otherwise. It is what lets a
+caller force two keys onto one node.
+
+| Quantity | Value |
+| --- | --- |
+| Service port | 6379 |
+| Cluster slots | 16,384 |
+| CRC-16/XMODEM polynomial | 0x1021 |
+| CRC-16/XMODEM initial value | 0x0000, with no reflection and no final xor |
+| Its check value over `123456789` | 0x31C3 |
+| CRC-16/CCITT-FALSE's check value over the same, for comparison | 0x29B1 |
+| Largest value Redis stores | 512 MB, so a frame's ceiling is the caller's |
+
+## Install
+
+```
+novo pkg add redis-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: redis-nv.<module>.<fn>`.  They
-turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
+use std.bytes
 use rdclient
 use rdcmd
+use rderror
 use rdresp
-use std.bytes
 
-// A value, or nothing, with a thirty-second life.
-fn cache_get(key: Str) -> ?Bytes [net, time]
+fn main() [io, net, time]
+    // Where to connect. `plain_transport` is the standard library's
+    // socket; a program that wants TLS supplies its own.
     match rdclient.connect(rdclient.default_options(), rdclient.plain_transport())
-        Err(f) => None
-        Ok(c) =>
-            match rdclient.call(c, rdcmd.get(bytes.from_str(key)))
-                Err(f) => None
-                Ok(r)  =>
-                    match rdresp.as_bulk(r.reply)
-                        Ok(v)  => v
-                        Err(_) => None
+        Err(f) => println(rderror.describe(f))
+        Ok(c)  =>
+            // SET session:7 to a value that expires in thirty seconds.
+            let cmd = rdcmd.set(bytes.from_str("session:7"), bytes.from_str("ada"),
+                                RdSeconds(30), RdSetAlways, false)
+            match rdclient.call(c, cmd)
+                Err(f) => println(rderror.describe(f))
+                Ok(w)  =>
+                    // Read it back. A missing key is `None`, not an error.
+                    match rdclient.call(w.conn, rdcmd.get(bytes.from_str("session:7")))
+                        Err(f) => println(rderror.describe(f))
+                        Ok(r)  =>
+                            match rdresp.as_bulk(r.reply)
+                                Err(f)      => println(rderror.describe(f))
+                                Ok(None)    => println("no such key")
+                                Ok(Some(v)) => println(bytes.to_str(v))
 ```
 
-A missing key is `None` and not an error — that is the commonest thing
-that happens to a Redis client and it is not a failure.
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: redis-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-## The layer, and why
+## What the package contains
 
-`host`, and half the package is `[]`.
+| Module | Contents |
+| --- | --- |
+| `rdresp` | Every frame type in both protocols, the framing, the encoder and decoder, and the readers that turn a frame into a value. |
+| `rdcmd` | A command as a value, its encoding, and typed constructors for the strings, hashes, lists, sets, sorted sets and streams. |
+| `rdclient` | The socket, the `HELLO` handshake, one call, a pipeline, a blocking call, and the queue of pushes that arrived meanwhile. |
+| `rdpubsub` | A subscription as a value the caller pumps, the four subscribe commands, and the reading of a push as a message. |
+| `rdtx` | `WATCH`, `MULTI`, queueing, `EXEC` and `DISCARD`, and the three things an `EXEC` can mean. |
+| `rdscript` | Lua scripts by body or by digest, the digest computed locally, the client's cache of known digests, and the function commands. |
+| `rdcluster` | The slot arithmetic, the hash tag, the CRC, the slot map, and the two redirections with their different rules. |
+| `rderror` | Every reason a call did not answer, the split between an error and an instruction, and the reading of a server's error reply. |
 
 `rdresp`, `rdcmd`, `rdcluster`'s slot arithmetic and `rderror` perform
-nothing: bytes in, frames out; frames in, bytes out; a key in, a slot
-out.  That is what lets the protocol be tested against captures with no
-server running, and it is why the cluster slot — the number everything
-routes on — has a unit test rather than an integration test.
+no input or output. That is what lets the protocol be tested against
+captures with no server running, and it is why the cluster slot, the
+number everything routes on, has a unit test rather than an
+integration test. `rdclient`, `rdpubsub`, `rdtx` and `rdscript`
+declare `[net]`, and `[time]` where a deadline is consulted, which for
+Redis means every blocking command. No module here declares `[io]`.
 
-`rdclient`, `rdpubsub`, `rdtx` and `rdscript` connect.  They declare
-`[net]`, and `[time]` where a deadline is consulted, which for Redis
-means every blocking command.  `[io]` is not owed: `std.net`'s free
-functions declare `[net]` alone, and no module here prints.
+`rdresp` encodes and decodes in both directions, because a frame is a
+frame whichever end sent it. A RESP server would take the module
+unchanged.
 
-**The `core` half is a MODULE split, and unlike postgres-nv this one
-has a second caller in sight.**  `rdresp` decodes and encodes in both
-directions already — a frame is a frame whichever end sent it — so a
-RESP SERVER would take the same module unchanged.  If one is written,
-`rdresp` moves out as `resp-nv` with no signature change and both ends
-take it.  Named here so that is a decision waiting rather than an
-omission.
+## How to choose an entry point
 
-## The load-bearing interface
+**`rdclient.call` sends one command and waits for its reply.** It
+routes pushes out of the way before it looks for one.
 
-`rdresp.RdFrame`, and the predicate that comes with it:
-`rdresp.is_push`.
+**`rdclient.pipeline` sends several commands in one write.** Redis
+answers them in order, and the round trip is paid once.
 
-```novo norun:pseudo
-pub enum RdFrame
-    RdSimple(v: Str)      // +      RdError(v: Str)          // - !
-    RdInt(v: Int)         // :      RdBulk(v: Bytes)         // $
-    RdArray(v: [RdFrame]) // *      RdNull                   // _ $-1 *-1
-    RdDouble(v: Float)    // ,      RdBool(v: Bool)          // #
-    RdVerbatim(…)         // =      RdBigNumber(v: Str)      // (
-    RdMap(…)              // %      RdSet(v: [RdFrame])      // ~
-    RdPush(v: [RdFrame])  // >
+**`rdclient.blocking_call` is for a command that waits on the
+server**, such as `BLPOP`. It takes the command's own timeout into
+account, so the socket deadline is not set below it.
+
+**`rdclient.send` and `read_reply` are the two halves**, for a caller
+that wants to interleave.
+
+**`rdcmd.command` and `command_text` build a command this package does
+not name.** Give the arguments, the positions of the keys and the
+reply shape expected.
+
+**`rdpubsub.subscription` is a value the caller pumps.**
+`rdpubsub.pump` advances it one message at a time and answers.
+
+**`rdresp` and `rdcmd` together are the whole protocol with no
+socket.** That is the path for a proxy, a capture reader and a test.
+
+## The rules a user needs
+
+1. **A push is not a reply, and `rdresp.is_push` is the predicate.**
+   `rdclient.call` routes on it before it looks for a reply, and
+   `rdclient.take_pushes` hands over the ones that arrived.
+2. **A RESP2 connection that is subscribed may run no other command.**
+   `rdpubsub.requires_second_connection` answers whether this
+   connection needs a second one, and
+   `rdpubsub.allowed_while_subscribed` answers whether a given command
+   may be sent.
+3. **One socket read is not one frame.** `rdresp.frame_length` says
+   how much of a buffer is one frame, and the client reassembles
+   across reads.
+4. **Bound the frame size before the first read.**
+   `rdresp.frame_length` takes `max_bytes`. The ceiling is the
+   caller's, because a Redis value can legitimately be 512 MB and the
+   length field is a number the wire supplies.
+5. **A missing key is `None`, not an error.** It is the commonest
+   thing that happens to a Redis client. `rdresp.as_bulk` answers
+   `Ok(None)`.
+6. **`MOVED` and `ASK` are instructions, not failures.**
+   `rderror.is_instruction` is the predicate. A client that surfaced
+   `MOVED` to its caller turned a routine redirect into an application
+   error.
+7. **`MOVED` updates the slot map and `ASK` does not.**
+   `rdcluster.updates_map` says which. Treating an `ASK` as a `MOVED`
+   points the map at the wrong node for the whole of a migration.
+8. **An `ASK` redirect needs an `ASKING` command first**, on the
+   connection to the new node, before the retried command.
+   `rdcluster.needs_asking` says so. Without it the new node answers
+   `MOVED` straight back, and the client loops.
+   `rdcluster.redirect_limit` bounds how many redirections one command
+   may follow.
+9. **The cluster CRC is XMODEM, not CCITT-FALSE.** They share the
+   polynomial 0x1021 and differ in the initial value: 0x0000 against
+   0xFFFF. A client using the wrong one computes a different slot for
+   every key, sends every command to the wrong node, is redirected,
+   and works anyway. Correct results, twice the latency, and nothing
+   in any log. `rdcluster.crc16_xmodem` is the one this package uses.
+10. **The hash-tag rule is exact.** It is the first `{`, the first `}`
+    after it, and the content between them must be non-empty. So
+    `{a}b{c}` hashes `a`, `foo{}bar` hashes the whole key, and
+    `foo{}{bar}` hashes `bar`. `rdcluster.hash_tag` is the rule, and
+    `rdcluster.same_slot` says whether a multi-key command's keys are
+    all on one node.
+11. **A plain `SET` clears any expiry the key had.** `RdKeepTtl` is
+    the option a caller updating a cached value almost always wants
+    and almost never writes. `RdExpiry` names all six possibilities,
+    and `rdcmd.set` puts them in the order the server expects.
+12. **A subscribe confirmation arrives as a push too.**
+    `rdpubsub.of_push` tells a confirmation from a message, and
+    `rdpubsub.is_message` is the check. A client that reads every push
+    as a message reports a phantom message per subscribe, forever.
+13. **`MULTI` has no rollback.** A command that fails at run time
+    inside `MULTI`/`EXEC` does not stop the others, and `EXEC` still
+    succeeds. The failure is one element of the reply array.
+    `rdtx.reply_failed` is the check, and `rdtx.failed_positions` says
+    which elements failed.
+14. **A null `EXEC` reply means a watched key changed.** Nothing ran,
+    and the caller retries the whole read-modify-write.
+    `RdExecOutcome` has three variants so that "it ran", "retry" and
+    "a queued command was malformed" cannot be collapsed.
+15. **`EXEC` and `DISCARD` clear every `WATCH`**, whether or not they
+    succeeded. A second attempt that does not watch again watches
+    nothing, and its `EXEC` succeeds against data that changed
+    underneath it.
+16. **Send `EVALSHA` first and fall back to `EVAL` on `NOSCRIPT`.**
+    `rdscript.digest_of` computes the digest locally, so the
+    optimistic call costs no round trip in the steady state.
+    `RdScriptCache` remembers which digests this client has seen.
+17. **Set the socket deadline above a blocking command's own
+    timeout.** A `BLPOP` with a thirty-second timeout on a socket with
+    a five-second deadline disconnects the client from itself.
+    `rdclient.blocking_call` is the call that gets it right.
+18. **A `HELLO` that answers an error is a RESP2 server, not a
+    failure.** Servers older than Redis 6 do not have the command.
+    `rdclient.connect` treats the error as the discovery it is, and
+    `rdclient.protocol_of` says which protocol the connection ended up
+    speaking.
+
+## What is not included
+
+- **Sentinel.** Finding a master through a sentinel quorum is a
+  different topology from cluster routing, and it wants its own
+  module.
+- **A connection pool.** `RdConn` is a value and a program holds as
+  many as it wants. A Redis connection is cheap, and the interesting
+  decision is pipelining depth rather than connection count.
+- **Client-side caching.** RESP3's tracking invalidations arrive as
+  pushes and are carried through, so a caller can build one. A cache
+  with an invalidation protocol is a package rather than a function.
+- **`KEYS`.** It blocks the server for the length of the scan, and on
+  a production instance that is an outage. `rdcmd.scan` is the
+  cursor-based alternative. A caller that really wants `KEYS` builds
+  it with `rdcmd.command`, having typed the name.
+- **A callback interface for subscriptions.** A callback would put the
+  caller's code inside this package's read loop, and therefore inside
+  this package's effect row: a handler that logged would make the pump
+  declare `[io]`, and every consumer would pay for the widest handler
+  any consumer wrote. `rdpubsub.pump` costs the caller exactly what
+  the caller does.
+- **A TLS implementation.** `RdTransport` is the seam, and
+  `rdclient.plain_transport` is the `std.net` pair.
+- **Asynchronous calls.** Every call blocks its task. `std.net` has
+  `recv_async` and this package does not use it yet.
+- **A big-integer parser.** `RdBigNumber` carries the decimal text. A
+  caller that needs the value takes it to `std.bigint`, and one that
+  only logs it does not pay for that.
+
+## Related packages
+
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) is the SHA-1
+  behind `rdscript.digest_of`. SHA-1 is Redis's choice here and is not
+  a security claim: the digest identifies a script in a cache this
+  client filled.
+- [crc-nv](https://novo-lang.org/packages/crc-nv) is not a dependency.
+  It publishes CRC-16/CCITT-FALSE and CRC-16/MODBUS, and has no public
+  constructor taking a parameter set, so XMODEM cannot be built from
+  its surface. `rdcluster.crc16_xmodem` carries its own table. A
+  parameterised constructor on crc-nv is what would let this package
+  take the dependency and delete the table.
+- [postgres-nv](https://novo-lang.org/packages/postgres-nv) and
+  [mysql-nv](https://novo-lang.org/packages/mysql-nv) are the same
+  shape for a SQL server: a codec half that performs nothing and a
+  client half over `std.net`.
+- `std.collections` in the standard library has `HashMap`, which is a
+  key-value store in this process. Take Redis when the store has to
+  outlive the process or be shared between several.
+- `std.net` in the standard library is where the bytes come from and
+  where they go.
+
+## Tests
+
+```bash
+novo test tests/rdresp_tests.nv      # 10 tests: the frames, both protocols
+novo test tests/rdcluster_tests.nv   #  8 tests: the slot, the tag, the redirections
+novo test tests/rdhost_tests.nv      # 10 tests: the client, pub/sub and transactions
 ```
 
-**Why `is_push` is the predicate the whole client turns on.**  In RESP2
-a pub/sub message arrives as an ordinary ARRAY — `["message", channel,
-payload]` — which is indistinguishable from an array REPLY to a command.
-A client cannot tell one from the other, which is exactly why Redis
-FORBIDS a subscribed RESP2 connection from running any other command:
-the ambiguity is unresolvable, so the protocol removes the case.
+The wire is Redis's own protocol specification, and the cluster
+specification is where the slot arithmetic and the two redirections
+come from. `redis-rs` and `redis-py` are the reference
+implementations for the shape of the API.
 
-RESP3 fixes it with a distinct type.  A `>` frame is not a reply to
-anything, which is what lets one connection carry commands and
-subscriptions at once — and it is what client-side caching's
-invalidation messages and `MONITOR` also ride on.  A client that decoded
-`>` and paired it with the next pending command answered that command
-with somebody else's message AND left every later reply off by one: a
-failure that starts one subscription after the bug and never stops.
+No test opens a socket. The suite checks the CRC against its published
+check value, `0x31C3` over `123456789`, and against CCITT-FALSE's
+`0x29B1` so the two cannot be confused. It checks the three hash-tag
+corners named in rule 10, that a push is not paired with a pending
+command, that all three spellings of null decode to one value, that a
+subscribe confirmation is not a message, that a null `EXEC` reply is
+read as contention rather than as an error, and that an error inside a
+successful `EXEC` is reported.
 
-So `is_push` is public, `rdclient.call` routes on it before it looks for
-a reply, and `rdpubsub.requires_second_connection` answers the question
-that falls out of it.
+The tests compile today and fail at run, each on the
+`not implemented: redis-nv.<module>.<fn>` panic that is its body. That
+is the expected state of an interface release. They turn green one at
+a time as bodies land.
 
-**The two protocols are one decoder, and that is not a convenience.**  A
-server speaks RESP2 until a client sends `HELLO 3`, so a decoder that
-only knew RESP3 could not read the reply to the `HELLO` that asks for
-it.  A server older than Redis 6 answers an error to `HELLO`, which is
-not a failure — it is the discovery that this is a RESP2 server — and
-`rdclient.connect` treats it that way.
+## Implementation status
 
-## What a client gets wrong quietly, and where each one has a name
+Nothing is implemented. Every function below is a `todo()`.
 
-| the mistake | what it costs | where it is named |
-| --- | --- | --- |
-| a push paired with a pending command | every later reply off by one | `rdresp.is_push` |
-| one socket read treated as one frame | works locally, fails pipelined | `rdresp.frame_length` |
-| the length field trusted | an allocation the wire asked for | `frame_length`'s `max_bytes` |
-| `MOVED` surfaced as an error | a routine redirect becomes an app failure | `rderror.is_instruction` |
-| `ASK` treated as `MOVED` | the slot map points at the wrong node for the whole migration | `rdcluster.updates_map` |
-| `ASKING` forgotten before an `ASK` redirect | a `MOVED` straight back, and a loop | `rdcluster.needs_asking` |
-| CRC-16/CCITT-FALSE instead of XMODEM | correct results at twice the latency, silently | `rdcluster.crc16_xmodem` |
-| a hash tag read loosely | `{a}b{c}` and `foo{}{bar}` routed wrong | `rdcluster.hash_tag` |
-| a subscribe confirmation read as a message | a phantom message per subscribe, forever | `rdpubsub.of_push` |
-| a null `EXEC` reply read as an error | normal contention becomes an app error | `rdtx.RdWatchBroken` |
-| an error inside a successful `EXEC` ignored | there is no rollback, so it happened | `rdtx.reply_failed` |
-| a socket deadline below a `BLPOP`'s | the client disconnects itself | `rdclient.blocking_call` |
+| Module | Public surface |
+| --- | --- |
+| `rdresp` | `frame_length`, `decode`, `encode`, `encode_null`, `is_push`, `is_error`, `is_resp3_only`, `type_byte`, `type_name`, `as_bulk`, `as_text`, `as_int`, `as_double`, `as_bool`, `as_list`, `as_pairs`, `as_fault` |
+| `rdcmd` | `command`, `command_text`, `encode`, `encode_pipeline`, `keys_of`, `name_of`; `hello`, `auth`, `ping`, `select_db`, `info`; `get`, `set`, `getdel`, `getex`, `del`, `exists`, `incrby`, `incrbyfloat`, `mget`, `mset`, `expire`, `ttl_ms`; `hget`, `hset`, `hdel`, `hgetall`, `hincrby`; `push`, `pop`, `blocking_pop`, `lrange`, `llen`; `sadd`, `srem`, `smembers`, `sismember`; `zadd`, `zscore`, `zrange`, `zrange_by_score`, `zrem`; `xadd`, `xrange`, `xread`, `xgroup_create`, `xreadgroup`, `xack`; `scan`, `scan_key` |
+| `rdclient` | `plain_transport`, `default_options`, `connect`, `close`, `protocol_of`, `call`, `pipeline`, `blocking_call`, `send`, `read_reply`, `take_pushes` |
+| `rdpubsub` | `requires_second_connection`, `allowed_while_subscribed`, `subscription`, `subscribe`, `psubscribe`, `ssubscribe`, `unsubscribe`, `punsubscribe`, `pump`, `drain`, `of_push`, `is_message`, `publish`, `spublish` |
+| `rdtx` | `transaction`, `watch`, `unwatch`, `watching`, `multi`, `queue`, `will_abort`, `exec`, `discard`, `reply_failed`, `failed_positions` |
+| `rdscript` | `digest_of`, `script`, `script_by_digest`, `cache`, `is_known`, `remember`, `forget`, `invalidate`, `evalsha`, `eval`, `eval_readonly`, `script_load`, `script_exists`, `script_flush`, `fcall`, `fcall_readonly`, `function_load` |
+| `rdcluster` | `slot_count`, `key_slot`, `hash_tag`, `crc16_xmodem`, `same_slot`, `command_slot`, `empty_map`, `cluster_shards`, `cluster_slots`, `asking`, `readonly`, `map_of_reply`, `owner_of`, `replicas_of`, `redirect_of`, `needs_asking`, `updates_map`, `with_moved`, `redirect_limit` |
+| `rderror` | `describe`, `of_error_reply`, `error_code`, `is_instruction`, `is_fatal`, `is_retryable` |
 
-## The cluster slot, and the CRC that is not the other one
+## Licence
 
-`rdcluster.key_slot` is `CRC16-XMODEM(hash_tag(key)) mod 16384`.
+Apache-2.0. See `LICENSE`.
 
-XMODEM is polynomial 0x1021, **initial value 0x0000**, no reflection, no
-final xor.  CCITT-FALSE is the same polynomial with an initial value of
-**0xffff**.  A client that used the second computes a different slot for
-every key, sends every command to the wrong node, gets a `MOVED`, and
-**works anyway** after one extra round trip.  Correct results, twice the
-latency, and nothing in any log — which is why the check value is
-asserted directly: XMODEM over `"123456789"` is `0x31C3`, CCITT-FALSE is
-`0x29B1`, and the empty input is `0x0000` against `0xFFFF`.
-
-**This is also why crc-nv is not a dependency.**  It publishes
-CCITT-FALSE and MODBUS, and has no public constructor taking a parameter
-set, so XMODEM cannot be built from its surface.  The table is here, and
-**the row this asks for is a `crc.custom(poly, init, xor_out, width,
-reflected)` on crc-nv** — after which this package takes the dependency
-and deletes its table.  That is the missing row this lane found.
-
-The hash-tag rule is exact and narrow, and each edge below is a shape a
-loose implementation gets wrong while mostly working: the **first** `{`,
-the **first** `}` after it, and the content between them must be
-**non-empty**.  So `{a}b{c}` hashes `a`, `foo{}bar` hashes the whole key,
-and `foo{}{bar}` hashes `bar`.
-
-## The subscription is a value, not a callback
-
-`rdpubsub.RdSubscription` holds what is subscribed and what has arrived;
-`pump` advances it one message at a time and answers.
-
-A callback would put the caller's code inside this package's read loop,
-which means inside this package's effect row: a handler that logged
-would make the pump `[io]`, one that wrote a file `[fs]`, and every
-consumer would pay for the widest handler any consumer wrote.  A value
-the caller pumps costs the caller exactly what the caller does.
-
-## What `MULTI` is not
-
-Two properties a caller will assume and should not:
-
-- **There is no rollback.**  A command that fails at runtime inside
-  `MULTI`/`EXEC` does not stop the others, and `EXEC` still succeeds;
-  the failure is one element of the reply array.  `rdtx.reply_failed` is
-  the check a caller would not think to make, because `EXEC` succeeded.
-- **A null `EXEC` reply is the contention signal, not an error.**  It
-  means a `WATCH`ed key changed and nothing ran, and the caller retries
-  the whole read-modify-write.  `RdExecOutcome` has three variants so
-  that "it ran", "retry" and "a command was malformed" cannot be
-  collapsed.
-
-And one rule a retry loop gets wrong: **every `WATCH` is cleared by
-`EXEC` or `DISCARD`**, succeeded or not.  A second attempt that did not
-re-`WATCH` watches nothing, and its `EXEC` succeeds against data that
-changed underneath it.
-
-## novokv, and the subset it does not implement
-
-The plan's row says redis-nv is "also novokv's client".  **It cannot be,
-as things stand, and that is a finding rather than a gap here.**
-
-`orbit/novokv` speaks a line-oriented text protocol in the memcached
-tradition — `GET`, `SET <key> <ttl_ms> <nbytes>` plus a body, `DEL`,
-`INCR`, `STATS`, `QUIT` — with `VALUE <n>` and `STORED` replies.  There
-is no RESP anywhere in it: not a type byte, not a bulk string, not an
-array.  A RESP client cannot talk to it, and a package named after RESP
-should not grow a second wire protocol to try.
-
-**The subset is exact, though, which is what makes the fix cheap.**
-Every one of novokv's six verbs has a RESP command with the same
-meaning, and this package already declares all six:
-
-| novokv | redis-nv | note |
-| --- | --- | --- |
-| `GET k` | `rdcmd.get` | `NOT_FOUND` is a null bulk string |
-| `SET k ttl n` + body | `rdcmd.set` with `RdMilliseconds` | novokv's ttl is already milliseconds, which is `PX` |
-| `DEL k` | `rdcmd.del` | the reply is a count rather than `DELETED` |
-| `INCR k delta` | `rdcmd.incrby` | novokv's delta may be negative, like `INCRBY`'s |
-| `STATS` | `rdcmd.info` | novokv answers per shard; `INFO` is per server |
-| `QUIT` | — | one command, and closing the socket does as well |
-
-So the row that closes it is **a RESP front door on novokv**: a listener
-that accepts inline arrays of bulk strings and answers `+`, `:`, `$` and
-`*`.  That is `rdresp` used in the other direction, which is the second
-caller the module-split section names — and after it, this package is
-novokv's client with no change at all.  Until then, the README says so
-rather than the plan's row implying otherwise.
-
-## One dependency
-
-**crypto-nv**, for SHA-1, for `EVALSHA` and nothing else.
-
-A client can get a script's digest from the server with `SCRIPT LOAD` —
-a round trip, on a connection, before the script can be used.  Computing
-it locally is what lets a client send `EVALSHA` optimistically and fall
-back to `EVAL` on `NOSCRIPT`, which costs zero round trips in the steady
-state and is the pattern every Redis client settled on.  `digest_of` is
-public because a caller logging which script ran needs the same forty
-characters.
-
-SHA-1 here is Redis's choice and is not a security claim: the digest
-identifies a script in a cache the client itself populated.
-
-## What is out of scope, out loud
-
-**Sentinel.**  Discovering a master through a sentinel quorum is a
-different topology from cluster routing and wants its own module or its
-own row.
-
-**A connection pool.**  `rdclient.RdConn` is a value and a program holds
-as many as it wants; the pooling questions Redis has are not
-PostgreSQL's — a connection is cheap, and the interesting decision is
-pipelining depth rather than connection count.
-
-**Client-side caching.**  RESP3's tracking invalidations arrive as
-pushes and `RdOtherPush` carries them, so a caller can implement it; a
-cache with an invalidation protocol is a package rather than a function.
-
-**`KEYS`.**  Deliberately not in `rdcmd`.  It blocks the server for the
-length of the scan, and on a production instance that is an outage.  A
-caller that really wants it builds it with `rdcmd.command`, having typed
-the name.
-
-**`async`.**  Every call blocks its task.  `std.net` has `recv_async`
-and this package does not use it yet; the row that wants it is a program
-holding many subscriptions per cell.
-
-## The reference implementations
-
-redis-rs and redis-py, for the API shape; Redis's own
-[protocol specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)
-for RESP2 and RESP3, which is what the module headers transcribe; the
-cluster specification for the slot arithmetic and the two redirections.
-
-The implementation lane's gate is a real `redis-server`: one node for
-the commands, a three-node cluster for the routing, and `redis-cli` for
-comparison.
-
-## Status
-
-Interface only.  Eight modules, 145 public functions, every body a
-`todo()`.
-
-- `novo pkg build` — clean, 8 modules checked.
-- `novo test` — three suites, all red, every failure `not implemented`.
-- `scripts/shard_audit.sh --strict` — `effect-budget`, `dep-layer`,
-  `no-discharge-in-core`, `doc-examples` and `docs-pub` green; `test`
-  red by design.
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
