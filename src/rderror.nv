@@ -88,6 +88,23 @@ pub enum RdFault
     // arguments at all, or a key where the command wants none.
     RdBadCommand(detail: Str)
 
+// `RdFault` is an `Error`, which is what lets `Result<T, RdFault>`
+// exist at all — `rdresp`'s frame decode, `rdcmd`'s command building,
+// `rdclient`'s round trips, `rdpubsub`'s pump, `rdtx`'s MULTI/EXEC
+// and `rdscript`'s EVAL all answer with one.
+impl Error for RdFault
+    // The one-line message: `rderror.describe`'s sentence.
+    //
+    // For a fault that is an INSTRUCTION rather than a failure — a
+    // `MOVED`, an `ASK`, a `NOSCRIPT`, a `TRYAGAIN` — a client is
+    // meant to act on it and not report it; `rderror.is_instruction`
+    // is the predicate that says which, and this sentence is what is
+    // left to print when it answers false.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("redis-nv.RdFault.message")
+
 // One line naming what went wrong, for a report a person reads.
 //
 // ```novo
